@@ -432,19 +432,40 @@ No audio hardware yet. Define the interface and trigger points now; implement la
 
 ---
 
-## 11. Build milestones (suggested order)
+## 11. Bring-up — assemble one lane at a time (feature-gated test modes)
 
-1. **Bring-up:** blink GP25 + RTT "hello" over the probe. Confirms toolchain/probe.
-2. **LEDs:** static color, then light one column at a time to **verify serpentine wiring &
-   direction** against `phys_index`.
-3. **One motor:** DRV8833 forward/reverse, verify direction, tune PWM floor/kick.
-4. **Switches:** RTT-print every start/end trip; confirm debounce.
-5. **Homing** routine (all-together gentle-stall + timeouts).
-6. **Race FSM** with fixed speeds → first-to-finish detection.
-7. **Randomization + LED chase** (progress dead-reckoning + comets).
-8. **Calibration mode + flash** persistence.
-9. **Winner animation** polish.
-10. **Audio:** keep `NullAudio`; wire DFPlayer when hardware arrives.
+Bring-up follows the physical assembly order. Each mode is a cargo feature (enable exactly
+one); the normal build is the full game. See `bringup.rs`.
+
+**Do this first, before any motor jogging:** install the **home *and* finish bumpers**
+(mechanical, independent of the switches). In `test-motors` there are no limit switches yet,
+so nothing in software stops a gantry from running off the end of the extrusion — the
+bumpers are the backstop. Use short taps until you trust the travel.
+
+1. **`--features test-motors`** — motor on the track, **no switches needed**. Tap a duck
+   button to pick the lane; **hold UP = forward, hold DOWN = reverse** at `JOG_DUTY_PCT`
+   (edit in `config.rs`). Verify: motor spins, belt drives the gantry, and **"forward"
+   moves toward the finish** — if reversed, swap that motor's two output leads at the
+   terminal. (Reverse uses the shared line, so it drives every *connected* motor; fine
+   while you have one lane wired.)
+2. **`--features test-lane`** — add that lane's start+finish switches. Tap a duck button to
+   pick the lane, **GO** = drive to the finish switch, then reverse home to the start
+   switch. RTT logs the times; confirms both switches, direction, and homing. Repeat
+   test-motors → test-lane per lane as you build each one.
+3. **`--features test-leds`** — after all tracks are placed and the LED strips installed:
+   Pass 1 walks a dot through the physical chain (watch it snake), Pass 2 lights each
+   column a distinct colour, Pass 3 walks a dot from each column's **start** end. Use this
+   to **verify wiring/direction and set the real `COUNTS`** in `config.rs`, then rebuild.
+4. **Default build (full game)** — everything but audio is done. Power up, hold **GO at
+   boot** to enter **TUNE** and calibrate each lane's baseline (saved to flash), then play.
+5. **Audio** — keep `NullAudio`; drop in the DFPlayer backend when the hardware arrives.
+
+> **Is this order optimal?** Yes — it matches your assembly and de-risks the drive train
+> first (the highest-uncertainty part). Two refinements folded in above: install the
+> bumpers *before* step 1 (no software end-stop exists yet), and do the forward-direction
+> check in step 1 so a mis-wired motor is caught before switches are involved. Run the
+> TUNE calibration (step 4) only once the whole rig is assembled, since baselines depend
+> on the real belt tension and friction of the finished lanes.
 
 ---
 
@@ -464,4 +485,8 @@ firmware/
     leds.rs             # Layout, phys_index, animations, PioWs2812 (§5)
     calibrate.rs        # TUNE mode + flash load/save (§6)
     audio.rs            # Sound/AudioSink stub → DFPlayer later (§9)
+    bringup.rs          # feature-gated motor-jog / single-lane test modes (§11)
 ```
+
+All four build configurations (default + the three `test-*` features) compile clean for
+`thumbv6m-none-eabi`. Untested on hardware — that's what §11 is for.

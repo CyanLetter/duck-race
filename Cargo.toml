@@ -5,6 +5,13 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Miniature duck-race arcade game — RP2040 / Embassy firmware"
 
+[features]
+default = []
+# Bring-up test modes — enable exactly ONE (see src/bringup.rs / IMPLEMENTATION.md §11):
+test-motors = [] # motor jog, hold-to-run, no switches needed
+test-lane = []   # single lane: drive to finish switch, return home
+test-leds = []   # WS2812 serpentine wiring/direction check
+
 # Versions match the sibling `ens160-air-quality` reference project (Embassy 0.9-era,
 # crates.io). Keep them on one Embassy generation; bump together per https://embassy.dev/book/.
 [dependencies]

@@ -196,6 +196,58 @@ impl<'d> LedController<'d> {
 
         self.ws.write(&self.fb).await;
     }
+
+    /// BRING-UP: verify serpentine wiring, direction, and per-column counts.
+    /// Pass 1 walks a single dot through the physical chain (watch it snake). Pass 2
+    /// lights each column a distinct colour (check extents/order). Pass 3 walks a dot
+    /// along each column from its START end (should always begin at the start, proving
+    /// `phys_index` compensates for the reversed odd columns). Loops forever.
+    #[cfg(feature = "test-leds")]
+    pub async fn test_walk(&mut self, wdt: &mut embassy_rp::watchdog::Watchdog) -> ! {
+        use embassy_time::{Duration, Timer};
+        const COLS: [RGB8; 5] = [
+            RGB8 { r: 80, g: 0, b: 0 },
+            RGB8 { r: 0, g: 80, b: 0 },
+            RGB8 { r: 0, g: 0, b: 80 },
+            RGB8 { r: 70, g: 70, b: 0 },
+            RGB8 { r: 0, g: 70, b: 70 },
+        ];
+        defmt::info!(
+            "BRINGUP LED test: pass1 dot walks chain, pass2 columns lit, pass3 per-column start->finish"
+        );
+        loop {
+            // Pass 1 — one dot through the physical chain.
+            for i in 0..NUM_LEDS {
+                self.fb = [RGB8::default(); NUM_LEDS];
+                self.fb[i] = RGB8 { r: 60, g: 60, b: 60 };
+                self.ws.write(&self.fb).await;
+                wdt.feed();
+                Timer::after(Duration::from_millis(45)).await;
+            }
+            // Pass 2 — each column a distinct colour, held ~2 s.
+            self.fb = [RGB8::default(); NUM_LEDS];
+            for c in 0..5 {
+                for p in 0..COUNTS[c] {
+                    self.fb[phys_index(c, p)] = COLS[c];
+                }
+            }
+            self.ws.write(&self.fb).await;
+            for _ in 0..40 {
+                wdt.feed();
+                Timer::after(Duration::from_millis(50)).await;
+            }
+            // Pass 3 — per column, dot from START(pos 0) to finish.
+            for c in 0..5 {
+                for p in 0..COUNTS[c] {
+                    self.fb = [RGB8::default(); NUM_LEDS];
+                    self.fb[phys_index(c, p)] = COLS[c];
+                    self.ws.write(&self.fb).await;
+                    wdt.feed();
+                    Timer::after(Duration::from_millis(40)).await;
+                }
+            }
+        }
+    }
 }
 
 /// Decoupled renderer: fixed frame tick, reads the latest `RaceView`, never blocked by

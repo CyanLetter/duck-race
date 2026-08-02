@@ -37,6 +37,10 @@ pub const fn pct_to_compare(pct: u8) -> u16 {
     (PWM_TOP as u32 * pct as u32 / 100) as u16
 }
 
+/// Duty used by the bring-up motor-jog and single-lane test modes. Edit to taste.
+#[cfg(any(feature = "test-motors", feature = "test-lane"))]
+pub const JOG_DUTY_PCT: u8 = 55;
+
 // ---- LED layout (5 serpentine columns for 4 lanes) ------------------------
 // All columns are the same physical length, but keep them per-column so trimming
 // differences don't break the mapping and so NUM_LEDS is a single source of truth.

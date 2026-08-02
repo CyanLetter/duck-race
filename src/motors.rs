@@ -9,7 +9,11 @@
 //! GP6 = slice3 A (shared reverse). A/B channels share frequency, independent duty.
 
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{
+    PIN_2, PIN_3, PIN_4, PIN_5, PIN_6, PIN_7, PWM_SLICE1, PWM_SLICE2, PWM_SLICE3,
+};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+use embassy_rp::Peri;
 
 use crate::config::{pct_to_compare, LANES, PWM_TOP};
 
@@ -40,6 +44,30 @@ impl<'d> Motors<'d> {
             cfg_rev: cfg,
             nsleep,
         }
+    }
+
+    /// Build the motor set from raw peripherals: GP2/3=slice1, GP4/5=slice2, GP6=slice3
+    /// reverse, GP7=nSLEEP. ~20 kHz PWM. Used by `main` and the bring-up modes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        slice1: Peri<'static, PWM_SLICE1>,
+        pin2: Peri<'static, PIN_2>,
+        pin3: Peri<'static, PIN_3>,
+        slice2: Peri<'static, PWM_SLICE2>,
+        pin4: Peri<'static, PIN_4>,
+        pin5: Peri<'static, PIN_5>,
+        slice3: Peri<'static, PWM_SLICE3>,
+        pin6: Peri<'static, PIN_6>,
+        nsleep: Peri<'static, PIN_7>,
+    ) -> Motors<'static> {
+        let mut cfg = PwmConfig::default();
+        cfg.top = PWM_TOP;
+        cfg.divider = 1u8.into();
+        let fwd01 = Pwm::new_output_ab(slice1, pin2, pin3, cfg.clone());
+        let fwd23 = Pwm::new_output_ab(slice2, pin4, pin5, cfg.clone());
+        let rev = Pwm::new_output_a(slice3, pin6, cfg.clone());
+        let nsleep = Output::new(nsleep, Level::Low);
+        Motors::new(fwd01, fwd23, rev, cfg, nsleep)
     }
 
     /// nSLEEP high = drivers enabled.
