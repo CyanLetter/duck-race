@@ -1,0 +1,38 @@
+[package]
+name = "duckrace"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Miniature duck-race arcade game — RP2040 / Embassy firmware"
+
+# Versions match the sibling `ens160-air-quality` reference project (Embassy 0.9-era,
+# crates.io). Keep them on one Embassy generation; bump together per https://embassy.dev/book/.
+[dependencies]
+embassy-executor = { version = "0.9.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-rp = { version = "0.9.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
+embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-futures = "0.1.2"
+
+# LED colour types (the WS2812 PIO driver itself is built into embassy-rp)
+smart-leds = "0.4"
+libm = "0.2"           # sinf/powf for animations + gamma LUT (no_std)
+
+# Logging / panic over the debug probe (RTT)
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+cortex-m = { version = "0.7.6", features = ["inline-asm"] }
+cortex-m-rt = "0.7.0"
+critical-section = "1.1"
+# M0+ has no native atomic CAS — route atomics through critical-section (as the reference does).
+portable-atomic = { version = "1.5", features = ["critical-section"] }
+
+[profile.release]
+debug = 2          # keep symbols for defmt/probe-rs; does not bloat the flash image
+lto = true
+opt-level = "s"
+
+[profile.dev]
+opt-level = "s"    # -O0 async on M0+ is large/slow; keep some optimisation

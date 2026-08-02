@@ -1,0 +1,16 @@
+# Matches the ens160-air-quality reference config.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "probe-rs run --chip RP2040"
+
+[build]
+target = "thumbv6m-none-eabi"        # Cortex-M0+ (original Pico / RP2040)
+
+[env]
+DEFMT_LOG = "debug"
+# Task futures (incl. led_task's framebuffer) live in the executor arena — give it room.
+EMBASSY_EXECUTOR_TASK_ARENA_SIZE = "32768"
+
+# No debug probe? Comment out `runner` above and flash a UF2 by hand instead:
+#   cargo build --release
+#   elf2uf2-rs target/thumbv6m-none-eabi/release/duckrace duckrace.uf2
+#   hold BOOTSEL, plug in, copy duckrace.uf2 to the RPI-RP2 volume  (loses live RTT logs)
