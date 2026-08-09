@@ -38,8 +38,9 @@ pub const fn pct_to_compare(pct: u8) -> u16 {
 }
 
 /// Duty used by the bring-up motor-jog and single-lane test modes. Edit to taste.
+/// Set fairly high for bring-up so a free/lightly-loaded motor clearly moves.
 #[cfg(any(feature = "test-motors", feature = "test-lane"))]
-pub const JOG_DUTY_PCT: u8 = 55;
+pub const JOG_DUTY_PCT: u8 = 100;
 
 // ---- LED layout (5 serpentine columns for 4 lanes) ------------------------
 // All columns are the same physical length, but keep them per-column so trimming

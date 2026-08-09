@@ -78,7 +78,8 @@ async fn main(_spawner: Spawner) {
         ];
         let fwd = Input::new(p.PIN_15, Pull::Up); // UP button = forward hold
         let rev = Input::new(p.PIN_16, Pull::Up); // DOWN button = reverse hold
-        bringup::motor_jog(motors, selects, fwd, rev, watchdog).await;
+        let fault = Input::new(p.PIN_8, Pull::Up); // DRV8833 nFAULT/ULT (low = fault)
+        bringup::motor_jog(motors, selects, fwd, rev, fault, watchdog).await;
     }
 
     // ================= BRING-UP: single lane, to-finish-and-home =================

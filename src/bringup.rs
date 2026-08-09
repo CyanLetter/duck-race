@@ -21,38 +21,97 @@ use crate::inputs::{recv, Event, EVENTS};
 use crate::motors::Motors;
 
 /// test-motors: hold-to-run jog with no limit switches required.
+/// `fault` is the DRV8833 nFAULT/ULT line (open-drain, LOW = fault) on GP8, read with a
+/// pull-up so we can tell if the driver has tripped.
 #[cfg(feature = "test-motors")]
 pub async fn motor_jog(
     mut motors: Motors<'static>,
     selects: [Input<'static>; LANES],
     fwd: Input<'static>,
     rev: Input<'static>,
+    fault: Input<'static>,
     mut wdt: Watchdog,
 ) -> ! {
     defmt::info!(
-        "BRINGUP motor jog @ {}%. Tap duck button = pick lane. Hold UP=fwd, DOWN=rev.",
+        "BRINGUP motor jog @ {}%. Tap duck = pick lane. Hold UP(GP15)=fwd, DOWN(GP16)=rev.",
         JOG_DUTY_PCT
     );
     defmt::info!("No end stops yet — use short taps so the gantry can't run off the rail!");
     motors.enable(true);
+    defmt::info!(
+        "nSLEEP/EEP set HIGH (GP7=enable). nFAULT/ULT (GP8) now reads: {}",
+        if fault.is_low() { "LOW = FAULT!" } else { "high = ok" }
+    );
+
     let mut active = 0usize;
+    let mut last_fwd = false;
+    let mut last_rev = false;
+    let mut last_fault = fault.is_low();
+    let mut ticks: u32 = 0;
+
     loop {
         wdt.feed();
+
+        // --- select (edge-logged) ---
         for (i, s) in selects.iter().enumerate() {
             if s.is_low() && active != i {
                 active = i;
-                defmt::info!("active lane = {}", active);
+                defmt::info!("SELECT: active lane = {}", active);
             }
         }
-        if fwd.is_low() {
+
+        // --- fault line (edge-logged) ---
+        let faulted = fault.is_low();
+        if faulted && !last_fault {
+            defmt::warn!("nFAULT asserted LOW — driver fault (check VM, overcurrent, thermal, wiring)");
+        } else if !faulted && last_fault {
+            defmt::info!("nFAULT cleared (high)");
+        }
+        last_fault = faulted;
+
+        // --- jog buttons (edge-logged) ---
+        let f = fwd.is_low();
+        let r = rev.is_low();
+        if f != last_fwd {
+            if f {
+                defmt::info!("UP (GP15) pressed -> lane {} FORWARD @ {}% (GP2=PWM, GP6=low)", active, JOG_DUTY_PCT);
+            } else {
+                defmt::info!("UP (GP15) released -> coast");
+            }
+            last_fwd = f;
+        }
+        if r != last_rev {
+            if r {
+                defmt::info!("DOWN (GP16) pressed -> REVERSE @ {}% (GP2=low, GP6=PWM)", JOG_DUTY_PCT);
+            } else {
+                defmt::info!("DOWN (GP16) released -> coast");
+            }
+            last_rev = r;
+        }
+
+        // --- drive ---
+        if f {
             let mut d = [0u8; LANES];
             d[active] = JOG_DUTY_PCT;
             motors.race_forward(d); // active lane forward, others 0
-        } else if rev.is_low() {
+        } else if r {
             motors.reverse_all(JOG_DUTY_PCT); // shared reverse line
         } else {
             motors.coast_all();
         }
+
+        // --- heartbeat every ~2 s so we know the loop is alive ---
+        ticks = ticks.wrapping_add(1);
+        if ticks % 100 == 0 {
+            defmt::info!(
+                "jog alive: lane {}, UP={}, DOWN={}, nFAULT={}",
+                active,
+                if f { "down" } else { "up" },
+                if r { "down" } else { "up" },
+                if faulted { "LOW" } else { "ok" }
+            );
+        }
+
         Timer::after(Duration::from_millis(20)).await;
     }
 }
