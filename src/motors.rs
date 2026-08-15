@@ -6,11 +6,16 @@
 //!   coast         : IN1=0,   IN2=0        brake         : IN1=1,  IN2=1
 //!
 //! PWM wiring: GP2/GP3 = slice1 A/B (lanes 0/1), GP4/GP5 = slice2 A/B (lanes 2/3),
-//! GP6 = slice3 A (shared reverse). A/B channels share frequency, independent duty.
+//! GP26 = slice5 A (shared reverse). A/B channels share frequency, independent duty.
+//! GP27 (nSLEEP) is slice5 B but used as a plain output — that channel stays unclaimed.
+//!
+//! On the common cheap DRV8833 breakouts, nSLEEP is silkscreened **EEP** and nFAULT is
+//! **ULT**; EEP must be driven high or the driver stays asleep at any duty. One motor
+//! uses ONE channel: IN1+IN2 → OUT1+OUT2 (or IN3+IN4 → OUT3+OUT4).
 
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{
-    PIN_2, PIN_3, PIN_4, PIN_5, PIN_6, PIN_7, PWM_SLICE1, PWM_SLICE2, PWM_SLICE3,
+    PIN_2, PIN_26, PIN_27, PIN_3, PIN_4, PIN_5, PWM_SLICE1, PWM_SLICE2, PWM_SLICE5,
 };
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::Peri;
@@ -46,8 +51,9 @@ impl<'d> Motors<'d> {
         }
     }
 
-    /// Build the motor set from raw peripherals: GP2/3=slice1, GP4/5=slice2, GP6=slice3
-    /// reverse, GP7=nSLEEP. ~20 kHz PWM. Used by `main` and the bring-up modes.
+    /// Build the motor set from raw peripherals: GP2/3=slice1, GP4/5=slice2,
+    /// GP26=slice5 shared reverse, GP27=nSLEEP. ~20 kHz PWM. Used by `main` and the
+    /// bring-up modes.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         slice1: Peri<'static, PWM_SLICE1>,
@@ -56,16 +62,16 @@ impl<'d> Motors<'d> {
         slice2: Peri<'static, PWM_SLICE2>,
         pin4: Peri<'static, PIN_4>,
         pin5: Peri<'static, PIN_5>,
-        slice3: Peri<'static, PWM_SLICE3>,
-        pin6: Peri<'static, PIN_6>,
-        nsleep: Peri<'static, PIN_7>,
+        slice5: Peri<'static, PWM_SLICE5>,
+        pin26: Peri<'static, PIN_26>,
+        nsleep: Peri<'static, PIN_27>,
     ) -> Motors<'static> {
         let mut cfg = PwmConfig::default();
         cfg.top = PWM_TOP;
         cfg.divider = 1u8.into();
         let fwd01 = Pwm::new_output_ab(slice1, pin2, pin3, cfg.clone());
         let fwd23 = Pwm::new_output_ab(slice2, pin4, pin5, cfg.clone());
-        let rev = Pwm::new_output_a(slice3, pin6, cfg.clone());
+        let rev = Pwm::new_output_a(slice5, pin26, cfg.clone());
         let nsleep = Output::new(nsleep, Level::Low);
         Motors::new(fwd01, fwd23, rev, cfg, nsleep)
     }

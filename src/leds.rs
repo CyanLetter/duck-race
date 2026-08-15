@@ -1,13 +1,16 @@
-//! WS2812 rendering: 5 serpentine columns, lane/progress space, decoupled renderer.
+//! WS2812 rendering: 4 serpentine rows, lane/progress space, decoupled renderer.
 //! Uses the built-in `embassy_rp::pio_programs::ws2812` driver. See IMPLEMENTATION.md §5.
 //!
-//! Column c is wired FORWARD (start→finish) if c is even, REVERSED if c is odd. Lane i
-//! is flanked by columns i (left) and i+1 (right); interior columns are shared by two
-//! lanes and composited per-pixel with max. `phys_index` absorbs the wiring direction so
-//! all higher-level code works in (lane, progress) space.
+//! Side-on cabinet: lanes are stacked vertically and **each lane owns one row** — `lane
+//! == row`, nothing shared. Row r is wired FORWARD (start→finish) if r is even, REVERSED
+//! if r is odd; `phys_index` absorbs that flip so all higher-level code works in
+//! (lane, progress) space.
+//!
+//! The chain order must match the physical top-to-bottom lane order AND the duck-button
+//! order — verify with `test_walk` (feature `test-leds`) before wiring the panel.
 
 use embassy_rp::Peri;
-use embassy_rp::peripherals::{DMA_CH0, PIN_9, PIO0};
+use embassy_rp::peripherals::{DMA_CH0, PIN_22, PIO0};
 use embassy_rp::pio::{Common, StateMachine};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -15,7 +18,7 @@ use embassy_sync::signal::Signal;
 use libm::{powf, sinf};
 use smart_leds::RGB8;
 
-use crate::config::{COUNTS, FRAME_MS, LANES, NUM_LEDS};
+use crate::config::{COUNTS, FRAME_MS, LANES, NUM_LEDS, ROWS};
 
 /// What the renderer should draw. Produced by the game task, consumed by `led_task`.
 #[derive(Clone, Copy)]
@@ -50,31 +53,31 @@ pub const DUCK_COLORS: [RGB8; LANES] = [
     RGB8 { r: 235, g: 190, b: 0 }, // yellow
 ];
 
-/// Prefix sums of COUNTS → each column's start index in the chain.
-const fn offsets() -> [usize; 5] {
-    let mut o = [0usize; 5];
+/// Prefix sums of COUNTS → each row's start index in the chain.
+const fn offsets() -> [usize; ROWS] {
+    let mut o = [0usize; ROWS];
     let mut i = 1;
-    while i < 5 {
+    while i < ROWS {
         o[i] = o[i - 1] + COUNTS[i - 1];
         i += 1;
     }
     o
 }
-const OFFSET: [usize; 5] = offsets();
+const OFFSET: [usize; ROWS] = offsets();
 
-/// Physical chain index for column `c` at position `p` measured FROM THE START.
-fn phys_index(c: usize, p: usize) -> usize {
-    if c % 2 == 0 {
-        OFFSET[c] + p // forward-wired column
+/// Physical chain index for row `r` at position `p` measured FROM THE START.
+fn phys_index(r: usize, p: usize) -> usize {
+    if r % 2 == 0 {
+        OFFSET[r] + p // forward-wired row
     } else {
-        OFFSET[c] + (COUNTS[c] - 1 - p) // reversed column
+        OFFSET[r] + (COUNTS[r] - 1 - p) // reversed row
     }
 }
 
-/// Map a progress fraction (0=start, 1=finish) to a position within column `c`.
-fn pos(c: usize, f: f32) -> usize {
+/// Map a progress fraction (0=start, 1=finish) to a position within row `r`.
+fn pos(r: usize, f: f32) -> usize {
     let f = f.clamp(0.0, 1.0);
-    (f * (COUNTS[c] - 1) as f32 + 0.5) as usize
+    (f * (COUNTS[r] - 1) as f32 + 0.5) as usize
 }
 
 pub struct LedController<'d> {
@@ -89,7 +92,7 @@ impl<'d> LedController<'d> {
         common: &mut Common<'d, PIO0>,
         sm: StateMachine<'d, PIO0, 0>,
         dma: Peri<'d, DMA_CH0>,
-        pin: Peri<'d, PIN_9>,
+        pin: Peri<'d, PIN_22>,
         program: &PioWs2812Program<'d, PIO0>,
     ) -> Self {
         // Precompute a gamma LUT once (keeps powf out of the per-frame hot path — the
@@ -122,29 +125,27 @@ impl<'d> LedController<'d> {
         p.b = p.b.max(c.b);
     }
 
-    /// Draw a comet at progress `f` on both columns flanking `lane`, with a short tail.
+    /// Draw a comet at progress `f` in `lane`'s row, with a short fading tail.
+    /// (`max_px` here only merges the comet's own overlapping tail — the shared-column
+    /// compositing the top-down layout needed is gone now that lane↔row is 1:1.)
     fn draw_comet(&mut self, lane: usize, f: f32, color: RGB8) {
         const TAIL: usize = 3;
-        for col in [lane, lane + 1] {
-            let head = pos(col, f);
-            for k in 0..=TAIL {
-                if head >= k {
-                    let bright = 1.0 - (k as f32 / (TAIL as f32 + 1.0));
-                    let idx = phys_index(col, head - k);
-                    let c = self.scaled(color, bright);
-                    Self::max_px(&mut self.fb, idx, c);
-                }
+        let head = pos(lane, f);
+        for k in 0..=TAIL {
+            if head >= k {
+                let bright = 1.0 - (k as f32 / (TAIL as f32 + 1.0));
+                let idx = phys_index(lane, head - k);
+                let c = self.scaled(color, bright);
+                Self::max_px(&mut self.fb, idx, c);
             }
         }
     }
 
     fn fill_lane(&mut self, lane: usize, color: RGB8, bright: f32) {
-        for col in [lane, lane + 1] {
-            for p in 0..COUNTS[col] {
-                let idx = phys_index(col, p);
-                let c = self.scaled(color, bright);
-                Self::max_px(&mut self.fb, idx, c);
-            }
+        let c = self.scaled(color, bright);
+        for p in 0..COUNTS[lane] {
+            let idx = phys_index(lane, p);
+            Self::max_px(&mut self.fb, idx, c);
         }
     }
 
@@ -197,23 +198,24 @@ impl<'d> LedController<'d> {
         self.ws.write(&self.fb).await;
     }
 
-    /// BRING-UP: verify serpentine wiring, direction, and per-column counts.
+    /// BRING-UP: verify serpentine wiring, direction, per-row counts, and row ORDER.
     /// Pass 1 walks a single dot through the physical chain (watch it snake). Pass 2
-    /// lights each column a distinct colour (check extents/order). Pass 3 walks a dot
-    /// along each column from its START end (should always begin at the start, proving
-    /// `phys_index` compensates for the reversed odd columns). Loops forever.
+    /// lights each row in its duck's colour — **check that row 0 is the same lane as
+    /// duck button 0, top to bottom, before the panel loom is soldered**. Pass 3 walks a
+    /// dot along each row from its START end (should always begin at the start, proving
+    /// `phys_index` compensates for the reversed odd rows). Loops forever.
     #[cfg(feature = "test-leds")]
     pub async fn test_walk(&mut self, wdt: &mut embassy_rp::watchdog::Watchdog) -> ! {
         use embassy_time::{Duration, Timer};
-        const COLS: [RGB8; 5] = [
-            RGB8 { r: 80, g: 0, b: 0 },
-            RGB8 { r: 0, g: 80, b: 0 },
-            RGB8 { r: 0, g: 0, b: 80 },
-            RGB8 { r: 70, g: 70, b: 0 },
-            RGB8 { r: 0, g: 70, b: 70 },
-        ];
+        // Row colours ARE the duck colours, dimmed — that's what makes pass 2 a valid
+        // check of the lane ↔ row ↔ button ordering.
+        let cols: [RGB8; ROWS] = core::array::from_fn(|r| RGB8 {
+            r: DUCK_COLORS[r].r / 3,
+            g: DUCK_COLORS[r].g / 3,
+            b: DUCK_COLORS[r].b / 3,
+        });
         defmt::info!(
-            "BRINGUP LED test: pass1 dot walks chain, pass2 columns lit, pass3 per-column start->finish"
+            "BRINGUP LED test: pass1 dot walks chain, pass2 rows in duck colours, pass3 per-row start->finish"
         );
         loop {
             // Pass 1 — one dot through the physical chain.
@@ -224,11 +226,11 @@ impl<'d> LedController<'d> {
                 wdt.feed();
                 Timer::after(Duration::from_millis(45)).await;
             }
-            // Pass 2 — each column a distinct colour, held ~2 s.
+            // Pass 2 — each row in its duck's colour, held ~2 s.
             self.fb = [RGB8::default(); NUM_LEDS];
-            for c in 0..5 {
-                for p in 0..COUNTS[c] {
-                    self.fb[phys_index(c, p)] = COLS[c];
+            for r in 0..ROWS {
+                for p in 0..COUNTS[r] {
+                    self.fb[phys_index(r, p)] = cols[r];
                 }
             }
             self.ws.write(&self.fb).await;
@@ -236,11 +238,11 @@ impl<'d> LedController<'d> {
                 wdt.feed();
                 Timer::after(Duration::from_millis(50)).await;
             }
-            // Pass 3 — per column, dot from START(pos 0) to finish.
-            for c in 0..5 {
-                for p in 0..COUNTS[c] {
+            // Pass 3 — per row, dot from START(pos 0) to finish.
+            for r in 0..ROWS {
+                for p in 0..COUNTS[r] {
                     self.fb = [RGB8::default(); NUM_LEDS];
-                    self.fb[phys_index(c, p)] = COLS[c];
+                    self.fb[phys_index(r, p)] = cols[r];
                     self.ws.write(&self.fb).await;
                     wdt.feed();
                     Timer::after(Duration::from_millis(40)).await;

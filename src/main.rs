@@ -1,8 +1,21 @@
 //! Duck Race — RP2040 / Embassy firmware entry point.
 //!
-//! Top-down pinball-style duck racer: select a duck, GO, four ducks race at randomized
-//! speeds, first to trip its finish switch wins, winner is shown, machine re-homes.
-//! No payout — prizes are handed out by hand. See ../IMPLEMENTATION.md for the full plan.
+//! Side-on duck racer (lanes stacked, ducks seen in profile): select a duck, GO, four
+//! ducks race at randomized speeds, first to trip its finish switch wins, winner is
+//! shown, machine re-homes. No payout — prizes are handed out by hand.
+//! See ../IMPLEMENTATION.md for the full plan.
+//!
+//! Pin banks (IMPLEMENTATION.md §3) — grouped so each cluster is one solderable header,
+//! since the Pico's pin strip carries a GND every 5th physical pin:
+//!   GP2–5   motor forward PWM, lanes 0–3   (physical 4–8,   GND at 8)
+//!   GP6–9   FINISH limit switches 0–3      (physical 9–13,  GND at 13)
+//!   GP10–14 duck buttons 0–3 + GO          (physical 14–19, GND at 18)
+//!   GP15    spare
+//!   GP16/17 TUNE up / down                 (physical 21–23, GND at 23)
+//!   GP18–21 HOME limit switches 0–3        (physical 24–28, GND at 28)
+//!   GP22    WS2812 data → 74AHCT125
+//!   GP26–28 shared reverse PWM / nSLEEP / nFAULT (physical 31–34, AGND at 33)
+//!   GP0/1   audio UART0 TX/RX → DY-SV8F (reserved, §9)
 //!
 //! Normal build runs the game (tasks: `led_task` + one input task per button/switch;
 //! game state machine runs inline in `main` so it never returns and the PIO `Common`
@@ -67,8 +80,8 @@ async fn main(_spawner: Spawner) {
     #[cfg(feature = "test-motors")]
     {
         let motors = Motors::build(
-            p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE3,
-            p.PIN_6, p.PIN_7,
+            p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE5,
+            p.PIN_26, p.PIN_27,
         );
         let selects = [
             Input::new(p.PIN_10, Pull::Up),
@@ -76,9 +89,9 @@ async fn main(_spawner: Spawner) {
             Input::new(p.PIN_12, Pull::Up),
             Input::new(p.PIN_13, Pull::Up),
         ];
-        let fwd = Input::new(p.PIN_15, Pull::Up); // UP button = forward hold
-        let rev = Input::new(p.PIN_16, Pull::Up); // DOWN button = reverse hold
-        let fault = Input::new(p.PIN_8, Pull::Up); // DRV8833 nFAULT/ULT (low = fault)
+        let fwd = Input::new(p.PIN_16, Pull::Up); // UP button = forward hold
+        let rev = Input::new(p.PIN_17, Pull::Up); // DOWN button = reverse hold
+        let fault = Input::new(p.PIN_28, Pull::Up); // DRV8833 nFAULT/ULT (low = fault)
         bringup::motor_jog(motors, selects, fwd, rev, fault, watchdog).await;
     }
 
@@ -90,17 +103,17 @@ async fn main(_spawner: Spawner) {
         _spawner.must_spawn(input_task(Input::new(p.PIN_12, Pull::Up), Event::Select(2)));
         _spawner.must_spawn(input_task(Input::new(p.PIN_13, Pull::Up), Event::Select(3)));
         _spawner.must_spawn(go_task(Input::new(p.PIN_14, Pull::Up)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_17, Pull::Up), Event::StartHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_18, Pull::Up), Event::StartHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_19, Pull::Up), Event::StartHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_20, Pull::Up), Event::StartHit(3)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_21, Pull::Up), Event::EndHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_22, Pull::Up), Event::EndHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_26, Pull::Up), Event::EndHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_27, Pull::Up), Event::EndHit(3)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_18, Pull::Up), Event::StartHit(0)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_19, Pull::Up), Event::StartHit(1)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_20, Pull::Up), Event::StartHit(2)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_21, Pull::Up), Event::StartHit(3)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_6, Pull::Up), Event::EndHit(0)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_7, Pull::Up), Event::EndHit(1)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_8, Pull::Up), Event::EndHit(2)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_9, Pull::Up), Event::EndHit(3)));
         let motors = Motors::build(
-            p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE3,
-            p.PIN_6, p.PIN_7,
+            p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE5,
+            p.PIN_26, p.PIN_27,
         );
         bringup::lane_sequence(motors, watchdog).await;
     }
@@ -110,23 +123,23 @@ async fn main(_spawner: Spawner) {
     {
         let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut common);
-        let mut leds = LedController::new(&mut common, sm0, p.DMA_CH0, p.PIN_9, &program);
+        let mut leds = LedController::new(&mut common, sm0, p.DMA_CH0, p.PIN_22, &program);
         leds.test_walk(&mut watchdog).await;
     }
 
     // =============================== NORMAL GAME =================================
     #[cfg(not(any(feature = "test-motors", feature = "test-lane", feature = "test-leds")))]
     {
-        // Motors: 2× DRV8833, shared reverse line.
+        // Motors: 2× DRV8833, shared reverse line on GP26.
         let motors = Motors::build(
-            p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE3,
-            p.PIN_6, p.PIN_7,
+            p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE5,
+            p.PIN_26, p.PIN_27,
         );
 
-        // LEDs: WS2812 chain on PIO0 SM0 / GP9 (via 74AHCT125).
+        // LEDs: WS2812 chain on PIO0 SM0 / GP22 (via 74AHCT125).
         let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut common);
-        let leds = LedController::new(&mut common, sm0, p.DMA_CH0, p.PIN_9, &program);
+        let leds = LedController::new(&mut common, sm0, p.DMA_CH0, p.PIN_22, &program);
         _spawner.must_spawn(led_task(leds));
 
         // Inputs. GO first: sample held-at-boot to enter TUNE, then hand to its task.
@@ -139,16 +152,16 @@ async fn main(_spawner: Spawner) {
         _spawner.must_spawn(input_task(Input::new(p.PIN_11, Pull::Up), Event::Select(1)));
         _spawner.must_spawn(input_task(Input::new(p.PIN_12, Pull::Up), Event::Select(2)));
         _spawner.must_spawn(input_task(Input::new(p.PIN_13, Pull::Up), Event::Select(3)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_15, Pull::Up), Event::Up));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_16, Pull::Up), Event::Down));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_17, Pull::Up), Event::StartHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_18, Pull::Up), Event::StartHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_19, Pull::Up), Event::StartHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_20, Pull::Up), Event::StartHit(3)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_21, Pull::Up), Event::EndHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_22, Pull::Up), Event::EndHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_26, Pull::Up), Event::EndHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_27, Pull::Up), Event::EndHit(3)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_16, Pull::Up), Event::Up));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_17, Pull::Up), Event::Down));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_18, Pull::Up), Event::StartHit(0)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_19, Pull::Up), Event::StartHit(1)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_20, Pull::Up), Event::StartHit(2)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_21, Pull::Up), Event::StartHit(3)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_6, Pull::Up), Event::EndHit(0)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_7, Pull::Up), Event::EndHit(1)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_8, Pull::Up), Event::EndHit(2)));
+        _spawner.must_spawn(input_task(Input::new(p.PIN_9, Pull::Up), Event::EndHit(3)));
 
         // Flash-persisted baselines.
         let mut flash = calibrate::new_flash(p.FLASH);

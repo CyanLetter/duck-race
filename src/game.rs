@@ -101,11 +101,13 @@ async fn race(
     audio: &mut NullAudio,
     base: &Baselines,
 ) -> Option<usize> {
-    // Per-lane duty = baseline ± random offset, clamped above the floor.
+    // Per-lane duty = baseline ± a random offset that is a PERCENTAGE OF THAT BASELINE,
+    // not a fixed number of duty points — so the feel survives motor swaps and per-lane
+    // calibration (the N20s moved the baseline from ~60 % to ~36 %). Clamped to the floor.
     let mut rng = RoscRng;
     let mut duties = [0u8; LANES];
-    let spread = SPEED_SPREAD_PCT as i32;
     for l in 0..LANES {
+        let spread = (base.pct[l] as i32 * SPEED_SPREAD_PCT as i32 / 100).max(1);
         let off = (rng.next_u32() % (2 * spread as u32 + 1)) as i32 - spread;
         duties[l] = (base.pct[l] as i32 + off).clamp(FLOOR_PCT as i32, 100) as u8;
     }

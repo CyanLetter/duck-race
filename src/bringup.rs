@@ -4,6 +4,8 @@
 //!   test-motors : motor on track, NO switches. Tap a duck button to pick the lane,
 //!                 hold UP = forward, hold DOWN = reverse, at JOG_DUTY_PCT. (Reverse uses
 //!                 the shared line → drives every *connected* motor; fine one-at-a-time.)
+//!                 Keep JOG_DUTY_PCT low — an N20 lane traverses 610 mm in ~2.2 s at
+//!                 100 %, and there is no software end stop in this mode.
 //!   test-lane   : add the lane's limit switches. Tap a duck button to pick the lane,
 //!                 GO = drive to the finish switch then return to the home switch.
 //!   test-leds   : (LedController::test_walk, in leds.rs) serpentine wiring check.
@@ -21,7 +23,7 @@ use crate::inputs::{recv, Event, EVENTS};
 use crate::motors::Motors;
 
 /// test-motors: hold-to-run jog with no limit switches required.
-/// `fault` is the DRV8833 nFAULT/ULT line (open-drain, LOW = fault) on GP8, read with a
+/// `fault` is the DRV8833 nFAULT/ULT line (open-drain, LOW = fault) on GP28, read with a
 /// pull-up so we can tell if the driver has tripped.
 #[cfg(feature = "test-motors")]
 pub async fn motor_jog(
@@ -33,13 +35,13 @@ pub async fn motor_jog(
     mut wdt: Watchdog,
 ) -> ! {
     defmt::info!(
-        "BRINGUP motor jog @ {}%. Tap duck = pick lane. Hold UP(GP15)=fwd, DOWN(GP16)=rev.",
+        "BRINGUP motor jog @ {}%. Tap duck = pick lane. Hold UP(GP16)=fwd, DOWN(GP17)=rev.",
         JOG_DUTY_PCT
     );
     defmt::info!("No end stops yet — use short taps so the gantry can't run off the rail!");
     motors.enable(true);
     defmt::info!(
-        "nSLEEP/EEP set HIGH (GP7=enable). nFAULT/ULT (GP8) now reads: {}",
+        "nSLEEP/EEP set HIGH (GP27=enable). nFAULT/ULT (GP28) now reads: {}",
         if fault.is_low() { "LOW = FAULT!" } else { "high = ok" }
     );
 
@@ -74,17 +76,17 @@ pub async fn motor_jog(
         let r = rev.is_low();
         if f != last_fwd {
             if f {
-                defmt::info!("UP (GP15) pressed -> lane {} FORWARD @ {}% (GP2=PWM, GP6=low)", active, JOG_DUTY_PCT);
+                defmt::info!("UP (GP16) pressed -> lane {} FORWARD @ {}% (IN1=PWM, GP26=low)", active, JOG_DUTY_PCT);
             } else {
-                defmt::info!("UP (GP15) released -> coast");
+                defmt::info!("UP (GP16) released -> coast");
             }
             last_fwd = f;
         }
         if r != last_rev {
             if r {
-                defmt::info!("DOWN (GP16) pressed -> REVERSE @ {}% (GP2=low, GP6=PWM)", JOG_DUTY_PCT);
+                defmt::info!("DOWN (GP17) pressed -> REVERSE @ {}% (IN1=low, GP26=PWM)", JOG_DUTY_PCT);
             } else {
-                defmt::info!("DOWN (GP16) released -> coast");
+                defmt::info!("DOWN (GP17) released -> coast");
             }
             last_rev = r;
         }
