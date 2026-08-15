@@ -25,14 +25,35 @@ pub const KICK_MS: u64 = 60;
 /// Homing duty — the light V-wheel gantry needs little torque, and the N20's low stall
 /// torque keeps the gentle stall-into-home-bumper soft (shared-reverse scheme, §4).
 /// 40 % ≈ 111 mm/s, so a full-length lane homes in ~5.5 s.
-pub const HOMING_PCT: u8 = 80;
+pub const HOMING_PCT: u8 = 65;
 /// Default per-lane baseline (overwritten by flash-persisted calibration).
 /// 36 % ≈ 102 mm/s ≈ 4 in/s → ~6 s over the 610 mm track.
-pub const BASE_DEFAULT_PCT: u8 = 80;
-/// Per-race random speed spread, as a percentage **of the lane's baseline** (± this %).
+pub const BASE_DEFAULT_PCT: u8 = 70;
+/// Random speed spread, as a percentage **of the lane's baseline** (± this %).
 /// Relative rather than absolute duty points so it survives motor swaps and per-lane
-/// calibration untouched — 20 % of 36 ≈ ±7 points, the same feel as the old ±12 on 60.
+/// calibration untouched. Re-rolled on every race *segment*, not once per race.
 pub const SPEED_SPREAD_PCT: u8 = 20;
+
+// ---- In-race speed variation ----------------------------------------------
+// Each lane runs a sequence of independent "segments". At the end of a segment it
+// re-rolls: usually a fresh speed around its baseline, occasionally a brief stall. Lanes
+// are scheduled independently, so leads change hands mid-race. Nothing is
+// pre-determined — the finish switch decides the winner. See IMPLEMENTATION.md §7.2.
+
+/// A running segment lasts a uniform-random time in this range.
+pub const SEGMENT_MIN_MS: u64 = 200;
+pub const SEGMENT_MAX_MS: u64 = 400;
+/// Chance (percent) that a re-roll produces a stall instead of a new speed.
+/// Cost in race time ≈ chance × stall/segment duration ratio — at 12 % that's ~7 % of
+/// the race spent stopped, so keep `RACE_TIMEOUT_MS` comfortably above the nominal.
+pub const STALL_CHANCE_PCT: u32 = 30;
+/// A stall lasts a uniform-random time in this range. Stalls coast (both inputs low),
+/// they don't brake — the duck drifts to a stop, which reads better than a hard stop.
+pub const STALL_MIN_MS: u64 = 100;
+pub const STALL_MAX_MS: u64 = 300;
+/// After a stall the motor has to break static friction again, so a lane leaving a stall
+/// gets `KICK_PCT` for this long before settling to its new speed.
+pub const RESUME_KICK_MS: u64 = 90;
 
 // ---- Timing ---------------------------------------------------------------
 /// Nominal race duration at the default baseline — used only to scale the LED
@@ -65,5 +86,5 @@ pub const JOG_DUTY_PCT: u8 = 80;
 // **Measure the real strips after the build and edit these, then rebuild** — the
 // count is a compile-time const generic on the WS2812 driver. See IMPLEMENTATION.md §5.
 pub const ROWS: usize = LANES;
-pub const COUNTS: [usize; ROWS] = [18, 18, 18, 18];
+pub const COUNTS: [usize; ROWS] = [39, 39, 39, 39];
 pub const NUM_LEDS: usize = COUNTS[0] + COUNTS[1] + COUNTS[2] + COUNTS[3];

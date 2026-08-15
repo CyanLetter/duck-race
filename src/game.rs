@@ -9,8 +9,9 @@ use embassy_time::{with_timeout, Duration, Instant, Timer};
 use crate::audio::{AudioSink, NullAudio, Sound};
 use crate::calibrate::{self, Baselines, CalFlash};
 use crate::config::{
-    FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, NOMINAL_SECS, RACE_TIMEOUT_MS,
-    RESET_TIMEOUT_MS, SPEED_SPREAD_PCT, WINNER_SHOW_MS, BASE_DEFAULT_PCT,
+    BASE_DEFAULT_PCT, FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, NOMINAL_SECS,
+    RACE_TIMEOUT_MS, RESET_TIMEOUT_MS, RESUME_KICK_MS, SEGMENT_MAX_MS, SEGMENT_MIN_MS,
+    SPEED_SPREAD_PCT, STALL_CHANCE_PCT, STALL_MAX_MS, STALL_MIN_MS, WINNER_SHOW_MS,
 };
 use crate::inputs::{self, recv, Event, EVENTS};
 use crate::leds::{Mode, RaceView, RACE_VIEW};
@@ -111,24 +112,36 @@ async fn select(wdt: &mut Watchdog, audio: &mut NullAudio) -> usize {
     }
 }
 
+/// Uniform random integer in `lo..=hi`.
+fn rand_range(rng: &mut RoscRng, lo: u64, hi: u64) -> u64 {
+    if hi <= lo {
+        return lo;
+    }
+    lo + (rng.next_u32() as u64) % (hi - lo + 1)
+}
+
+/// Roll a running speed for one lane: its calibrated baseline ± a random offset that is
+/// a PERCENTAGE OF THAT BASELINE, not a fixed number of duty points — so the feel
+/// survives motor swaps and per-lane calibration. Clamped to the floor.
+fn roll_speed(rng: &mut RoscRng, base_pct: u8) -> u8 {
+    let spread = (base_pct as i32 * SPEED_SPREAD_PCT as i32 / 100).max(1);
+    let off = (rng.next_u32() % (2 * spread as u32 + 1)) as i32 - spread;
+    (base_pct as i32 + off).clamp(FLOOR_PCT as i32, 100) as u8
+}
+
 /// Run the race. Returns the winning lane, or None on timeout.
+///
+/// Speed varies *during* the race: each lane runs independently-scheduled segments,
+/// re-rolling a new speed (or occasionally a brief stall) at random intervals, so the
+/// lead changes hands. Fully random — nothing is pre-determined and the finish switch
+/// alone decides the winner. See IMPLEMENTATION.md §7.2.
 async fn race(
     motors: &mut Motors<'_>,
     wdt: &mut Watchdog,
     audio: &mut NullAudio,
     base: &Baselines,
 ) -> Option<usize> {
-    // Per-lane duty = baseline ± a random offset that is a PERCENTAGE OF THAT BASELINE,
-    // not a fixed number of duty points — so the feel survives motor swaps and per-lane
-    // calibration (the N20s moved the baseline from ~60 % to ~36 %). Clamped to the floor.
     let mut rng = RoscRng;
-    let mut duties = [0u8; LANES];
-    for l in 0..LANES {
-        let spread = (base.pct[l] as i32 * SPEED_SPREAD_PCT as i32 / 100).max(1);
-        let off = (rng.next_u32() % (2 * spread as u32 + 1)) as i32 - spread;
-        duties[l] = (base.pct[l] as i32 + off).clamp(FLOOR_PCT as i32, 100) as u8;
-    }
-    defmt::info!("race duties {}", duties);
 
     // Winner detection stays EDGE-driven (unlike homing): the finish switches are the
     // one measurement where timing resolution matters, and an edge lands sooner and more
@@ -138,20 +151,70 @@ async fn race(
 
     audio.play(Sound::Race);
     motors.enable(true);
-    motors.race_forward([KICK_PCT; LANES]); // launch kick
+    motors.race_forward([KICK_PCT; LANES]); // launch kick, all lanes together
     Timer::after(Duration::from_millis(KICK_MS)).await;
-    motors.race_forward(duties);
 
+    // Opening segment: every lane gets a real speed — no stall on the first leg, since a
+    // duck sitting still off the line reads as a fault rather than as drama.
     let start = Instant::now();
+    let mut target = [0u8; LANES]; // the speed this lane is currently trying to hold
+    let mut next_change = [start; LANES]; // when this lane re-rolls
+    let mut kick_until = [start; LANES]; // stall-recovery kick window
+    for l in 0..LANES {
+        target[l] = roll_speed(&mut rng, base.pct[l]);
+        next_change[l] =
+            start + Duration::from_millis(rand_range(&mut rng, SEGMENT_MIN_MS, SEGMENT_MAX_MS));
+    }
+    defmt::info!("race opening duties {}", target);
+
+    let mut commanded = [0u8; LANES];
     let mut progress = [0.0f32; LANES];
+    let mut last = start;
     let winner;
     loop {
         wdt.feed();
-        // Visual progress ∝ elapsed × duty (real finish is decided by the switch).
-        let el = start.elapsed().as_millis() as f32 / 1000.0;
+        let now = Instant::now();
+
+        // --- re-roll any lane whose segment has expired ---
         for l in 0..LANES {
-            progress[l] =
-                (el * duties[l] as f32 / (NOMINAL_SECS * BASE_DEFAULT_PCT as f32)).min(1.0);
+            if now < next_change[l] {
+                continue;
+            }
+            let stalling = target[l] == 0;
+            if !stalling && rng.next_u32() % 100 < STALL_CHANCE_PCT {
+                // Enter a stall: coast (duty 0), don't brake — the duck drifts to a stop.
+                let ms = rand_range(&mut rng, STALL_MIN_MS, STALL_MAX_MS);
+                target[l] = 0;
+                next_change[l] = now + Duration::from_millis(ms);
+                defmt::info!("lane {} stalls for {} ms", l, ms);
+            } else {
+                // New running speed. Coming out of a stall, the motor has to break static
+                // friction again, so open with a brief kick.
+                if stalling {
+                    kick_until[l] = now + Duration::from_millis(RESUME_KICK_MS);
+                }
+                target[l] = roll_speed(&mut rng, base.pct[l]);
+                next_change[l] =
+                    now + Duration::from_millis(rand_range(&mut rng, SEGMENT_MIN_MS, SEGMENT_MAX_MS));
+            }
+        }
+
+        // --- what we actually drive this frame (stall-recovery kick overrides target) ---
+        let cmd: [u8; LANES] = core::array::from_fn(|l| {
+            if now < kick_until[l] { KICK_PCT.max(target[l]) } else { target[l] }
+        });
+        if cmd != commanded {
+            motors.race_forward(cmd);
+            commanded = cmd;
+        }
+
+        // --- visual progress: INTEGRATE the duty actually commanded, since it now
+        //     changes mid-race (real finish is still decided by the switch) ---
+        let dt = (now - last).as_micros() as f32 / 1_000_000.0;
+        last = now;
+        for l in 0..LANES {
+            let step = cmd[l] as f32 * dt / (NOMINAL_SECS * BASE_DEFAULT_PCT as f32);
+            progress[l] = (progress[l] + step).min(1.0);
         }
         RACE_VIEW.signal(RaceView { mode: Mode::Race, progress });
 
@@ -162,7 +225,7 @@ async fn race(
                 break;
             }
             Ok(_) => {}
-            Err(_) => {} // frame tick — recompute progress
+            Err(_) => {} // frame tick — re-roll, re-drive, recompute progress
         }
         if start.elapsed() > Duration::from_millis(RACE_TIMEOUT_MS) {
             winner = None;

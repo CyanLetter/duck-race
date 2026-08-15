@@ -489,8 +489,8 @@ larger fraction of the commanded speed than it was with the TTs. Two ways;
   **last flash sector** via `embassy_rp::flash` (or `sequential-storage` for wear-leveled
   KV). Load on boot; fall back to safe defaults if magic/CRC invalid. **Write only on
   explicit save** (flash wear).
-- Final race duty per lane: `clamp(baseline_i + random_offset (+ optional mid-race surge),
-  FLOOR, 100)` — baseline centers each lane so the race is fair; randomness adds the fun.
+- The baseline is the *centre* each lane's mid-race speed segments are rolled around
+  (§7.2) — calibration makes the lanes fair, the segment rolls add the fun.
 
 ### 6.2 Alternative — physical trim knobs (if you'd rather have knobs)
 
@@ -560,15 +560,48 @@ and leaves the same hang in every other place that waits on a limit switch.
 | **Home** | `reverse_all(homing)`; wait until all 4 StartHit (per-lane `with_timeout`), then cut power | Attract |
 | **Attract** | idle shimmer; wait for any `Select` | Selecting |
 | **Selecting** | track current pick; `Select` updates it; light its lane | on `Go` (pick set) → Race |
-| **Race** | randomize speeds from baselines, kick, drive forward, publish progress; await first `EndHit` (overall `with_timeout`) | on `EndHit(w)` → Winner(w); on timeout → Home |
+| **Race** | kick, then run per-lane speed segments that re-roll mid-race (§7.2), publishing progress; await first `EndHit` (overall `with_timeout`) | on `EndHit(w)` → Winner(w); on timeout → Home |
 | **Winner(w)** | `brake_all`; winner flash/chase; (future: sound); ~4 s | Home |
 | **Tune** | calibration UX (§6); entered only via GO-held-at-boot | Home (on save) |
 
-Randomization: per race, offset each lane by ±X% around its baseline; optionally give one
-random lane a brief mid-race "surge" for drama. All clamped to `FLOOR..=100`.
-
 Input gating: ignore `Select/Go` during Race/Home; ignore `StartHit/EndHit` when not
 racing/homing.
+
+### 7.2 Race speed model — segments, not a single roll
+
+Speed varies **during** the race, not once at the start. Each lane runs an independent
+sequence of *segments*; when a lane's segment expires it re-rolls, and the lanes are
+scheduled independently, so the lead changes hands. Nothing is pre-determined — the
+finish switch alone decides the winner.
+
+Per re-roll, a lane either:
+- **runs** at `baseline ± SPEED_SPREAD_PCT %` of its own calibrated baseline, clamped to
+  `FLOOR_PCT..=100`, for `SEGMENT_MIN_MS..=SEGMENT_MAX_MS`; or
+- **stalls** (probability `STALL_CHANCE_PCT`) at duty 0 for
+  `STALL_MIN_MS..=STALL_MAX_MS`.
+
+Four details that matter more than they look:
+
+1. **Stalls coast, they don't brake.** Duty 0 leaves both DRV8833 inputs low, so the duck
+   drifts to a stop. Braking both inputs high would stop it dead and read as a fault.
+2. **Leaving a stall gets a `KICK_PCT` kick for `RESUME_KICK_MS`.** `FLOOR_PCT` is the
+   minimum *moving* duty; a lane that has actually stopped has to break static friction
+   again, and at these floors it may not restart without it.
+3. **No stall in the opening segment.** A duck sitting still off the line reads as a
+   broken machine rather than as drama, so the first segment is always a running speed.
+4. **Progress is now integrated, not extrapolated.** The LED dead-reckoning was
+   `elapsed × duty`, which is only valid while duty is constant. It accumulates
+   `duty × dt` per frame instead, so a stalled duck's comet stops with it.
+
+**Race-time cost of stalls** ≈ `STALL_CHANCE_PCT × (mean stall ÷ mean segment)`. At the
+defaults that's ~7 % of the race spent stopped, so `RACE_TIMEOUT_MS` must stay comfortably
+above the nominal duration (12 s against a ~6 s nominal — plenty).
+
+**Tuning the feel:** shorter `SEGMENT_*` = twitchier, more lead changes; higher
+`SPEED_SPREAD_PCT` = bigger gaps; higher `STALL_CHANCE_PCT` = more comedy, longer races.
+`FLOOR_PCT` sets the floor of the *running* range — if it sits close to the baseline the
+spread gets clipped and slow ducks bunch at exactly the floor, so keep
+`baseline × (1 − spread) > FLOOR_PCT`.
 
 ---
 
