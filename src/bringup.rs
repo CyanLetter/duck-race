@@ -144,45 +144,44 @@ pub async fn lane_sequence(mut motors: Motors<'static>, mut wdt: Watchdog) -> ! 
 async fn run_to_end_and_home(motors: &mut Motors<'_>, wdt: &mut Watchdog, lane: usize) {
     use crate::config::{HOMING_PCT, RACE_TIMEOUT_MS, RESET_TIMEOUT_MS};
 
-    defmt::info!("lane {} -> forward", lane);
-    motors.enable(true);
-    let mut d = [0u8; LANES];
-    d[lane] = JOG_DUTY_PCT;
-    motors.race_forward(d);
-    let start = Instant::now();
-    loop {
-        wdt.feed();
-        if let Ok(Event::EndHit(l)) =
-            with_timeout(Duration::from_millis(200), EVENTS.receive()).await
-        {
-            if l as usize == lane {
-                defmt::info!("lane {} reached FINISH in {} ms", lane, start.elapsed().as_millis());
+    // Both legs poll switch LEVELS rather than waiting on arrival edges, so starting a
+    // leg already parked on the switch it's driving toward reports instantly instead of
+    // burning the full timeout.
+    if crate::inputs::end_closed(lane) {
+        defmt::info!("lane {} already at FINISH — skipping forward leg", lane);
+    } else {
+        defmt::info!("lane {} -> forward", lane);
+        motors.enable(true);
+        let mut d = [0u8; LANES];
+        d[lane] = JOG_DUTY_PCT;
+        motors.race_forward(d);
+        let start = Instant::now();
+        while !crate::inputs::end_closed(lane) {
+            wdt.feed();
+            let _ = with_timeout(Duration::from_millis(50), EVENTS.receive()).await;
+            if start.elapsed() > Duration::from_millis(RACE_TIMEOUT_MS) {
+                defmt::warn!("lane {} finish timeout — check end switch / motor", lane);
                 break;
             }
         }
-        if start.elapsed() > Duration::from_millis(RACE_TIMEOUT_MS) {
-            defmt::warn!("lane {} finish timeout — check end switch / motor", lane);
-            break;
-        }
+        defmt::info!("lane {} forward leg took {} ms", lane, start.elapsed().as_millis());
     }
 
-    defmt::info!("lane {} -> home (reverse)", lane);
-    motors.reverse_all(HOMING_PCT);
-    let start = Instant::now();
-    loop {
-        wdt.feed();
-        if let Ok(Event::StartHit(l)) =
-            with_timeout(Duration::from_millis(200), EVENTS.receive()).await
-        {
-            if l as usize == lane {
-                defmt::info!("lane {} HOME in {} ms", lane, start.elapsed().as_millis());
+    if crate::inputs::home_closed(lane) {
+        defmt::info!("lane {} already HOME — skipping return leg", lane);
+    } else {
+        defmt::info!("lane {} -> home (reverse)", lane);
+        motors.reverse_all(HOMING_PCT);
+        let start = Instant::now();
+        while !crate::inputs::home_closed(lane) {
+            wdt.feed();
+            let _ = with_timeout(Duration::from_millis(50), EVENTS.receive()).await;
+            if start.elapsed() > Duration::from_millis(RESET_TIMEOUT_MS) {
+                defmt::warn!("lane {} home timeout — check start switch / bumper", lane);
                 break;
             }
         }
-        if start.elapsed() > Duration::from_millis(RESET_TIMEOUT_MS) {
-            defmt::warn!("lane {} home timeout — check start switch / bumper", lane);
-            break;
-        }
+        defmt::info!("lane {} home leg took {} ms", lane, start.elapsed().as_millis());
     }
     motors.coast_all();
 }

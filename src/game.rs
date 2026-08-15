@@ -12,7 +12,7 @@ use crate::config::{
     FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, NOMINAL_SECS, RACE_TIMEOUT_MS,
     RESET_TIMEOUT_MS, SPEED_SPREAD_PCT, WINNER_SHOW_MS, BASE_DEFAULT_PCT,
 };
-use crate::inputs::{recv, Event, EVENTS};
+use crate::inputs::{self, recv, Event, EVENTS};
 use crate::leds::{Mode, RaceView, RACE_VIEW};
 use crate::motors::Motors;
 
@@ -38,24 +38,41 @@ pub async fn run(
     }
 }
 
-/// Reverse all lanes into their home bumpers until every start switch trips (shared
+/// Reverse all lanes into their home bumpers until every start switch is closed (shared
 /// reverse line → early arrivers gently stall against the bumper until all are home).
+///
+/// Works off switch *levels*, not arrival events: a lane that is already resting on its
+/// home switch (very common at power-up) never produces a falling edge, so an
+/// events-only wait would hang until `RESET_TIMEOUT_MS` every single boot.
 async fn home(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: &mut NullAudio) {
     RACE_VIEW.signal(RaceView { mode: Mode::Home, progress: [0.0; LANES] });
     audio.play(Sound::Home);
     motors.enable(true);
-    motors.reverse_all(HOMING_PCT);
 
     let mut homed = [false; LANES];
-    let mut remaining = LANES;
+    let mut remaining = 0usize;
+    for l in 0..LANES {
+        homed[l] = inputs::home_closed(l);
+        if !homed[l] {
+            remaining += 1;
+        }
+    }
+    if remaining == 0 {
+        defmt::info!("all lanes already home — no movement needed");
+        motors.coast_all();
+        return;
+    }
+    defmt::info!("homing: {} lane(s) to go, already home = {}", remaining, homed);
+    motors.reverse_all(HOMING_PCT);
+
     let start = Instant::now();
     while remaining > 0 {
         wdt.feed();
-        if let Ok(Event::StartHit(l)) =
-            with_timeout(Duration::from_millis(500), EVENTS.receive()).await
-        {
-            let l = l as usize;
-            if l < LANES && !homed[l] {
+        // The timeout sets the poll cadence; receiving also keeps the event channel from
+        // backing up while we're driving (input tasks block on a full channel).
+        let _ = with_timeout(Duration::from_millis(50), EVENTS.receive()).await;
+        for l in 0..LANES {
+            if !homed[l] && inputs::home_closed(l) {
                 homed[l] = true;
                 remaining -= 1;
             }
@@ -112,6 +129,12 @@ async fn race(
         duties[l] = (base.pct[l] as i32 + off).clamp(FLOOR_PCT as i32, 100) as u8;
     }
     defmt::info!("race duties {}", duties);
+
+    // Winner detection stays EDGE-driven (unlike homing): the finish switches are the
+    // one measurement where timing resolution matters, and an edge lands sooner and more
+    // precisely than a polled level. That makes a stale queued edge dangerous, so start
+    // from an empty channel — a leftover EndHit would otherwise win instantly.
+    inputs::drain();
 
     audio.play(Sound::Race);
     motors.enable(true);

@@ -13,7 +13,7 @@ use embassy_time::{with_timeout, Duration, Instant};
 use crate::config::{
     BASE_DEFAULT_PCT, FLOOR_PCT, HOMING_PCT, LANES, RACE_TIMEOUT_MS, RESET_TIMEOUT_MS,
 };
-use crate::inputs::{recv, Event, EVENTS};
+use crate::inputs::{self, recv, Event, EVENTS};
 use crate::leds::{Mode, RaceView, RACE_VIEW};
 use crate::motors::Motors;
 
@@ -113,36 +113,28 @@ pub async fn tune_mode(
 }
 
 /// Run one lane forward to its finish switch, then home it — so you can eyeball speed.
+/// Both legs poll switch *levels* (see `inputs`): waiting on edges alone would hang for
+/// the full timeout whenever the lane already starts on the switch it's driving toward.
 async fn test_lane(motors: &mut Motors<'_>, wdt: &mut Watchdog, lane: usize, pct: u8) {
     motors.enable(true);
     motors.set_lane_forward(lane, pct);
     let start = Instant::now();
-    loop {
+    while !inputs::end_closed(lane) {
         wdt.feed();
-        if let Ok(Event::EndHit(l)) =
-            with_timeout(Duration::from_millis(200), EVENTS.receive()).await
-        {
-            if l as usize == lane {
-                break;
-            }
-        }
+        let _ = with_timeout(Duration::from_millis(50), EVENTS.receive()).await;
         if start.elapsed() > Duration::from_millis(RACE_TIMEOUT_MS) {
+            defmt::warn!("TUNE: lane {} finish timeout", lane);
             break;
         }
     }
     // Home this lane (shared reverse drives all, but the others are already home).
     motors.reverse_all(HOMING_PCT);
     let start = Instant::now();
-    loop {
+    while !inputs::home_closed(lane) {
         wdt.feed();
-        if let Ok(Event::StartHit(l)) =
-            with_timeout(Duration::from_millis(200), EVENTS.receive()).await
-        {
-            if l as usize == lane {
-                break;
-            }
-        }
+        let _ = with_timeout(Duration::from_millis(50), EVENTS.receive()).await;
         if start.elapsed() > Duration::from_millis(RESET_TIMEOUT_MS) {
+            defmt::warn!("TUNE: lane {} home timeout", lane);
             break;
         }
     }
