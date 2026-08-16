@@ -9,6 +9,8 @@
 //!   test-lane   : add the lane's limit switches. Tap a duck button to pick the lane,
 //!                 GO = drive to the finish switch then return to the home switch.
 //!   test-leds   : (LedController::test_walk, in leds.rs) serpentine wiring check.
+//!   test-audio  : DY-SV8F clip check — no motors or switches needed, just the module,
+//!                 the button panel and a speaker.
 //!
 //! Enable exactly one, e.g. `cargo run --release --features test-motors`.
 
@@ -184,4 +186,90 @@ async fn run_to_end_and_home(motors: &mut Motors<'_>, wdt: &mut Watchdog, lane: 
         defmt::info!("lane {} home leg took {} ms", lane, start.elapsed().as_millis());
     }
     motors.coast_all();
+}
+
+/// test-audio: verify the DY-SV8F wiring, mode straps, clip set and track numbering.
+/// Needs no motors and no limit switches — just the module, the button panel, a speaker.
+///
+///   duck button N : play that duck's bet clip directly (track N+1)
+///   GO            : play the NEXT clip in the full set, cycling 1..=7
+///   UP / DOWN     : volume + / −
+///
+/// Every trigger logs the track number it asked for, so you can match what you hear
+/// against the map in `audio.rs` and catch an off-by-one in the file numbering.
+#[cfg(feature = "test-audio")]
+pub async fn audio_check<A: crate::audio::AudioSink>(
+    mut audio: A,
+    selects: [Input<'static>; LANES],
+    go: Input<'static>,
+    up: Input<'static>,
+    down: Input<'static>,
+    mut wdt: Watchdog,
+) -> ! {
+    use crate::audio::{Sound, VOLUME_MAX};
+
+    const CYCLE: [(Sound, &str); 7] = [
+        (Sound::Bet(0), "00001.mp3  bet / duck 0"),
+        (Sound::Bet(1), "00002.mp3  bet / duck 1"),
+        (Sound::Bet(2), "00003.mp3  bet / duck 2"),
+        (Sound::Bet(3), "00004.mp3  bet / duck 3"),
+        (Sound::Race, "00005.mp3  race"),
+        (Sound::Win, "00006.mp3  finish / WIN"),
+        (Sound::Lose, "00007.mp3  finish / LOSE"),
+    ];
+
+    defmt::info!("BRINGUP audio (DY-SV8F). Duck button = that bet clip; GO = next clip; UP/DOWN = volume.");
+    defmt::info!("If nothing plays at all: check the DIP straps are UART mode, GP0 -> module RXD, common GND, speaker on the module.");
+
+    let mut idx = 0usize;
+    let mut volume = crate::audio::VOLUME_DEFAULT;
+    let mut last_sel = [false; LANES];
+    let mut last_go = false;
+    let mut last_up = false;
+    let mut last_down = false;
+    let mut ticks: u32 = 0;
+
+    loop {
+        wdt.feed();
+
+        for (i, s) in selects.iter().enumerate() {
+            let now = s.is_low();
+            if now && !last_sel[i] {
+                defmt::info!("duck {} -> {}", i, CYCLE[i].1);
+                audio.play(Sound::Bet(i as u8));
+            }
+            last_sel[i] = now;
+        }
+
+        let g = go.is_low();
+        if g && !last_go {
+            let (sound, label) = CYCLE[idx];
+            defmt::info!("GO -> [{}/{}] {}", idx + 1, CYCLE.len(), label);
+            audio.play(sound);
+            idx = (idx + 1) % CYCLE.len();
+        }
+        last_go = g;
+
+        let u = up.is_low();
+        if u && !last_up {
+            volume = (volume + 2).min(VOLUME_MAX);
+            defmt::info!("volume -> {}/{}", volume, VOLUME_MAX);
+            audio.set_volume(volume);
+        }
+        last_up = u;
+
+        let d = down.is_low();
+        if d && !last_down {
+            volume = volume.saturating_sub(2);
+            defmt::info!("volume -> {}/{}", volume, VOLUME_MAX);
+            audio.set_volume(volume);
+        }
+        last_down = d;
+
+        ticks = ticks.wrapping_add(1);
+        if ticks % 250 == 0 {
+            defmt::info!("audio check alive: next GO plays [{}/{}]", idx + 1, CYCLE.len());
+        }
+        Timer::after(Duration::from_millis(20)).await;
+    }
 }

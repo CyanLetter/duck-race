@@ -26,12 +26,17 @@
 #![no_main]
 // Bring-up builds intentionally leave the game/LED code paths unused.
 #![cfg_attr(
-    any(feature = "test-motors", feature = "test-lane", feature = "test-leds"),
+    any(
+        feature = "test-motors",
+        feature = "test-lane",
+        feature = "test-leds",
+        feature = "test-audio"
+    ),
     allow(dead_code, unused_imports, unused_variables, unused_mut)
 )]
 
 mod audio;
-#[cfg(any(feature = "test-motors", feature = "test-lane"))]
+#[cfg(any(feature = "test-motors", feature = "test-lane", feature = "test-audio"))]
 mod bringup;
 mod calibrate;
 mod config;
@@ -46,9 +51,11 @@ use embassy_rp::gpio::{Input, Pull};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::PioWs2812Program;
+use embassy_rp::uart::{Config as UartConfig, UartTx};
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Duration, Timer};
 
+use crate::audio::DySv8f;
 use crate::config::WATCHDOG_MS;
 use crate::inputs::{go_task, input_task, Event};
 use crate::leds::{led_task, LedController};
@@ -58,15 +65,25 @@ use {defmt_rtt as _, panic_probe as _};
 
 // Compile-time guard: only one bring-up mode at a time.
 #[cfg(any(
-    all(feature = "test-motors", feature = "test-lane"),
-    all(feature = "test-motors", feature = "test-leds"),
-    all(feature = "test-lane", feature = "test-leds"),
+    all(
+        feature = "test-motors",
+        any(feature = "test-lane", feature = "test-leds", feature = "test-audio")
+    ),
+    all(feature = "test-lane", any(feature = "test-leds", feature = "test-audio")),
+    all(feature = "test-leds", feature = "test-audio"),
 ))]
-compile_error!("enable only one of: test-motors, test-lane, test-leds");
+compile_error!("enable only one of: test-motors, test-lane, test-leds, test-audio");
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
+
+/// DY-SV8F serial settings: 9600 8N1 (Reference/DY-SV8F.pdf, "UART Mode").
+fn audio_uart_config() -> UartConfig {
+    let mut cfg = UartConfig::default();
+    cfg.baudrate = 9600;
+    cfg
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -118,6 +135,28 @@ async fn main(_spawner: Spawner) {
         bringup::lane_sequence(motors, watchdog).await;
     }
 
+    // ======================= BRING-UP: audio clip check ==========================
+    #[cfg(feature = "test-audio")]
+    {
+        let mut audio = DySv8f::new(UartTx::new_blocking(p.UART0, p.PIN_0, audio_uart_config()));
+        audio.init().await;
+        let selects = [
+            Input::new(p.PIN_10, Pull::Up),
+            Input::new(p.PIN_11, Pull::Up),
+            Input::new(p.PIN_12, Pull::Up),
+            Input::new(p.PIN_13, Pull::Up),
+        ];
+        bringup::audio_check(
+            audio,
+            selects,
+            Input::new(p.PIN_14, Pull::Up), // GO
+            Input::new(p.PIN_16, Pull::Up), // TUNE up   = volume +
+            Input::new(p.PIN_17, Pull::Up), // TUNE down = volume −
+            watchdog,
+        )
+        .await;
+    }
+
     // ===================== BRING-UP: LED serpentine walk =========================
     #[cfg(feature = "test-leds")]
     {
@@ -128,7 +167,12 @@ async fn main(_spawner: Spawner) {
     }
 
     // =============================== NORMAL GAME =================================
-    #[cfg(not(any(feature = "test-motors", feature = "test-lane", feature = "test-leds")))]
+    #[cfg(not(any(
+        feature = "test-motors",
+        feature = "test-lane",
+        feature = "test-leds",
+        feature = "test-audio"
+    )))]
     {
         // Motors: 2× DRV8833, shared reverse line on GP26.
         let motors = Motors::build(
@@ -170,7 +214,11 @@ async fn main(_spawner: Spawner) {
             defmt::info!("GO held at boot → entering TUNE mode");
         }
 
+        // Audio: DY-SV8F on UART0 TX (GP0) → module RXD, playing from its onboard flash.
+        let mut audio = DySv8f::new(UartTx::new_blocking(p.UART0, p.PIN_0, audio_uart_config()));
+        audio.init().await;
+
         // Run the game inline (never returns; keeps PIO `common` alive).
-        game::run(motors, watchdog, flash, base, boot_tune).await;
+        game::run(motors, watchdog, flash, base, boot_tune, audio).await;
     }
 }

@@ -633,66 +633,100 @@ and `WATCHDOG_MS` are unaffected by the hardware changes.
 
 ---
 
-## 9. Audio — stub now, **DY-SV8F** later (`audio.rs`)
+## 9. Audio — **DY-SV8F** over UART0 (`audio.rs`) — implemented
 
-> **Changed from DFPlayer Mini to the DY-SV8F.** (Sold as "DV-SV8F" by some resellers; it's
-> the DY-series module.) Good news first: **nothing structural changes.** It's still a
-> serial-controlled MP3 module with a built-in amp on **2 UART pins at 9600 baud**, the
-> `AudioSink` trait is untouched, and the game's trigger points are identical. Only the
-> **command frame format** differs, which is entirely inside the backend struct.
+Serial-controlled MP3 module with a built-in 5 W class-D amp, playing from **onboard
+8 MB flash** (no microSD). Datasheet: `Reference/DY-SV8F.pdf`. Replaced the originally
+planned DFPlayer Mini; the `AudioSink` trait and the game's trigger points are unchanged,
+only the frame format differs.
 
-- **Hardware:** DY-SV8F on **UART0 — GP0 TX → module RX, GP1 RX ← module TX** (§3.2, 3-pin
-  header with GND at physical pin 3), 4 Ω/8 Ω speaker on the module's built-in amp, volume
-  set by serial command (no pot needed — which is good, since all three ADC pins are spent;
-  §6.2).
-- **Onboard 4 MB flash, no microSD.** Clips are loaded over USB (the module enumerates as
-  mass storage). **Track index = the order files were written to flash**, not alphabetical
-  — copy them **one at a time, in the order you want them numbered**, or track selection
-  will be scrambled. This is the classic DY-series gotcha.
-- **Mode selection is a hardware config, not software.** The DY-SV8F picks UART vs one-line
-  vs IO-combination mode from the strapping on its `CON`/IO pins **at power-up**. You've
-  said it's set for UART — worth confirming the strap resistors are actually populated
-  before writing any driver code, because in IO mode the UART simply won't answer.
-- **Protocol differs from the DFPlayer** — this is the only real code delta:
+### 9.1 Wiring & module configuration
 
-  | | DFPlayer Mini (old plan) | **DY-SV8F (now)** |
-  |---|---|---|
-  | Frame | 10 bytes, `7E FF 06 CMD 00 P1 P2 CK CK EF` | variable, `AA <CMD> <LEN> <DATA…> <SUM>` |
-  | Checksum | 16-bit two's complement | **low byte of the additive sum** of all preceding bytes |
-  | Typical ops | play / pause / volume / track | play / pause / stop / volume / select track |
+| | |
+|---|---|
+| Serial | **9600 8N1**, Pico **GP0 (UART0 TX) → module RXD/IO1 (pin 4)**, common GND |
+| Module TXD (pin 3) | → GP1 if status queries are ever wanted. **The driver is TX-only** — the game never needs a reply |
+| Mode | **UART mode**, selected by the board's 3-way DIP (CON1/2/3) **at power-up**, not in software |
+| Power | 5 V; decouple it — the amp pulls real current on transients and shares the rail with the motors |
+| Speaker | 4 Ω, 3–5 W on the module's own amp; there is also a **hardware volume trimpot** on the board, independent of the software volume |
+| Optional | `BUSY` (pin 11) → **GP15**, the spare, if the game should ever know when a clip ends |
 
-  Take the **opcodes from the module's own datasheet** rather than from this document —
-  the DY series has several variants and the command tables differ between them. The frame
-  *shape* above is what the code should be built around; write a small
-  `fn frame(cmd: u8, data: &[u8]) -> heapless::Vec<u8, 8>` helper that appends the additive
-  checksum, and every command becomes one line.
-- **3.3 V drive:** the module runs off 5 V but its serial input is 3.3 V-compatible. Put a
-  ~1 kΩ series resistor on the Pico's TX line anyway, and decouple the module's 5 V — the
-  built-in amp pulls real current on transients and shares a rail with the motors.
-- **Optional `BUSY` line** → **GP17**, the one spare pin (§3.3), if you want the game to
-  know when a clip has finished rather than timing it open-loop.
-- **Trigger points (call sites wired now, no-op today):**
-  - `Sound::Bet` — a duck is selected (Selecting).
-  - `Sound::Race` — race start / looping race bed (Race entry).
-  - `Sound::Finish` — first duck crosses the line (Winner entry).
-  - (nice-to-have) `Sound::Attract`, `Sound::Home`.
-- **Stub interface (unchanged):**
-  ```rust
-  pub enum Sound { Bet, Race, Finish, Attract, Home }
-  pub trait AudioSink { fn play(&mut self, s: Sound); fn set_volume(&mut self, v: u8); }
-  pub struct NullAudio; // current: logs via defmt, does nothing
-  // later: struct DySv8f<UART> { … } building AA-prefixed, additive-checksum frames
-  ```
-  `game.rs` calls `audio.play(Sound::…)` at the trigger points regardless of backend, so
-  adding the module later is a drop-in swap of `NullAudio` → `DySv8f`.
+> **Datasheet caveats worth knowing.** (1) Its Work Mode Configuration table prints the
+> same `CON3 CON2 CON1 = 1 0 0` for *both* UART Mode and One-Line Mode — one of them is a
+> typo, so confirm the mode empirically (if the module ignores UART frames, try the other
+> DIP position). (2) The pin-definition table says `BUSY` is **LOW while playing**, while
+> the I/O-mode tables say it's high — verify before relying on it.
 
-> **Pin-pressure fallback:** the DY-SV8F's **one-line single-bus mode** drives playback
-> with timed pulses on a *single* GPIO (any pin), freeing one. It can only select tracks —
-> no volume command — so it's a fallback, not the plan. **IO-combination mode is worse
-> here**: it burns several GPIO to select clips by pin pattern, which is exactly the
-> resource we're short of.
+### 9.2 Protocol
+
+Frames are `AA <cmd> <len> <data…> <sum>`, where `sum` is the **low byte of the arithmetic
+sum** of every preceding byte. (Not the DFPlayer's `7E…EF` / two's-complement scheme.)
+
+| Purpose | Frame | Notes |
+|---|---|---|
+| Select drive | `AA 0B 01 02 B8` | `02` = onboard FLASH (USB=00, SD=01) |
+| Play track *n* | `AA 07 02 <hi> <lo> <sum>` | "Specified Song" — `n` is the filename number |
+| Set volume | `AA 13 01 <vol> <sum>` | `vol` 0..=30, module default 20 |
+| Set play mode | `AA 18 01 02 C5` | `02` = single-stop (play once, then stop) |
+| Stop | `AA 04 00 AE` | |
+| Query status | `AA 01 00 AB` | replies `AA 01 01 <00 stop\|01 play\|02 pause> <sum>` — needs RX |
+
+`init()` runs select-drive → set-mode → set-volume at startup, after a short delay (the
+module isn't ready to accept commands the instant power comes up).
+
+### 9.3 Track map — **name the files exactly like this**
+
+The DY-SV8F selects a track by the **number in its 5-digit filename**, so numbering is
+determined by what you call the files:
+
+| File | `Sound` | Played when |
+|------|---------|-------------|
+| `00001.mp3` | `Bet(0)` | duck 0 selected |
+| `00002.mp3` | `Bet(1)` | duck 1 selected |
+| `00003.mp3` | `Bet(2)` | duck 2 selected |
+| `00004.mp3` | `Bet(3)` | duck 3 selected |
+| `00005.mp3` | `Race`  | race starts |
+| `00006.mp3` | `Win`   | **the player's duck won** |
+| `00007.mp3` | `Lose`  | a different duck won |
+
+- `Sound::Attract` and `Sound::Home` map to **no track** (silent). The call sites exist, so
+  assigning clips later is one line in `Sound::track()`.
+- **Copy the files onto the flash in numeric order anyway.** Filename numbering is what the
+  datasheet documents, but some DY-family firmware indexes by FAT write order — copying in
+  order costs nothing and makes both behaviours agree.
+- Win vs. lose is relative to **the duck the player picked**, so `show_winner` takes the
+  pick as well as the winner. A race that times out with no finisher plays nothing.
+
+### 9.4 Interface
+
+```rust
+pub enum Sound { Bet(u8), Race, Win, Lose, Attract, Home }
+pub trait AudioSink { fn play(&mut self, s: Sound); fn set_volume(&mut self, v: u8); }
+pub struct DySv8f<'d> { /* UartTx<'d, Blocking>, volume */ }
+pub struct NullAudio;  // logs via defmt; swap in if the module is unplugged
+```
+
+`game::run` is generic over `A: AudioSink`, so swapping backends is a one-word change in
+`main.rs`. Writes use `blocking_write` into the UART's 32-byte TX FIFO — a 6-byte frame
+never fills it, so nothing stalls the executor or the LED renderer (§2.1).
+
+### 9.5 Bring-up — `--features test-audio`
+
+Needs only the module, the button panel and a speaker; no motors, no limit switches.
+
+| Control | Action |
+|---|---|
+| Duck button *N* | play that duck's bet clip directly (track *N*+1) |
+| **GO** | play the **next** clip in the whole set, cycling `00001`…`00007` |
+| **TUNE up / down** | volume ± 2 (0..=30) |
+
+Every trigger logs the track number it requested, so comparing what you hear against §9.3
+catches an off-by-one in the file numbering immediately. If *nothing* plays: check the DIP
+straps are on UART mode, GP0 really lands on the module's **RXD**, the grounds are common,
+and the speaker is on the module's own amp output.
 
 ---
+
 
 ## 10. Other unknowns / things to consider
 
@@ -750,10 +784,13 @@ and `WATCHDOG_MS` are unaffected by the hardware changes.
 20. **Finish line reads edge-on now** — with lanes stacked, the four finish points are
     vertically aligned and hard to read at a glance from the side. Consider a physical
     finish-line marker or a distinct end-of-row LED treatment.
-21. **DY-SV8F track order = flash write order**, not filename order. Copy clips one at a
-    time in the intended sequence. (§9)
-22. **DY-SV8F mode strapping** is latched at power-up from its CON/IO pins — confirm the
-    UART-mode straps are populated before writing driver code. (§9)
+21. **DY-SV8F track numbering** follows the **5-digit filename** (`00003.mp3` = track 3),
+    per the datasheet. Copy the clips onto the flash in numeric order anyway — some
+    DY-family firmware indexes by write order instead, and copying in order makes both
+    behaviours agree. Verify with `--features test-audio`. (§9.3, §9.5)
+22. **DY-SV8F mode strapping** is latched at power-up from the CON1/2/3 DIP switch, not
+    set in software. The datasheet prints the *same* code for UART and One-Line mode, so
+    if the module ignores UART frames, try the other DIP position. (§9.1)
 23. **All 26 GPIO are allocated** under the §3.2 map, with GP17 the only spare. Any new
     peripheral means spending a pressure valve (§3.3) — decide before adding anything, not
     after.
@@ -800,8 +837,11 @@ bumpers are the backstop. Use short taps until you trust the travel.
    boot** to enter **TUNE** and calibrate each lane's baseline (saved to flash), then play.
    With the N20s this pass matters more than it did: the narrow duty band means the
    baselines carry more of the fairness (§6).
-5. **Audio** — keep `NullAudio`; drop in the `DySv8f` backend when the module is strapped
-   for UART and the clips are loaded in order (§9).
+5. **`--features test-audio`** — DY-SV8F clip check; needs only the module, the button
+   panel and a speaker, so it can be run at any point. Duck buttons play each bet clip,
+   GO steps through all seven, TUNE up/down set volume. Confirms the UART straps, the
+   wiring, and that the file numbering matches the map in §9.3. The full game uses the
+   `DySv8f` backend by default — swap in `NullAudio` in `main.rs` to run silently.
 
 > **Is this order optimal?** Yes — it matches your assembly and de-risks the drive train
 > first (the highest-uncertainty part). Two refinements folded in above: install the

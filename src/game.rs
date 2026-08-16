@@ -6,7 +6,7 @@ use embassy_rp::clocks::RoscRng;
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 
-use crate::audio::{AudioSink, NullAudio, Sound};
+use crate::audio::{AudioSink, Sound};
 use crate::calibrate::{self, Baselines, CalFlash};
 use crate::config::{
     BASE_DEFAULT_PCT, FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, NOMINAL_SECS,
@@ -18,24 +18,23 @@ use crate::leds::{Mode, RaceView, RACE_VIEW};
 use crate::motors::Motors;
 
 /// Never-returning game driver.
-pub async fn run(
+pub async fn run<A: AudioSink>(
     mut motors: Motors<'static>,
     mut wdt: Watchdog,
     mut flash: CalFlash,
     mut base: Baselines,
     boot_tune: bool,
+    mut audio: A,
 ) {
-    let mut audio = NullAudio;
-
     if boot_tune {
         calibrate::tune_mode(&mut motors, &mut wdt, &mut flash, &mut base).await;
     }
 
     loop {
         home(&mut motors, &mut wdt, &mut audio).await;
-        let _pick = select(&mut wdt, &mut audio).await;
+        let pick = select(&mut wdt, &mut audio).await;
         let winner = race(&mut motors, &mut wdt, &mut audio, &base).await;
-        show_winner(&mut motors, &mut wdt, &mut audio, winner).await;
+        show_winner(&mut motors, &mut wdt, &mut audio, pick, winner).await;
     }
 }
 
@@ -45,7 +44,7 @@ pub async fn run(
 /// Works off switch *levels*, not arrival events: a lane that is already resting on its
 /// home switch (very common at power-up) never produces a falling edge, so an
 /// events-only wait would hang until `RESET_TIMEOUT_MS` every single boot.
-async fn home(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: &mut NullAudio) {
+async fn home<A: AudioSink>(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: &mut A) {
     RACE_VIEW.signal(RaceView { mode: Mode::Home, progress: [0.0; LANES] });
     audio.play(Sound::Home);
     motors.enable(true);
@@ -87,7 +86,7 @@ async fn home(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: &mut NullAudio
 }
 
 /// Attract until a duck is selected, then let the player change the pick until GO.
-async fn select(wdt: &mut Watchdog, audio: &mut NullAudio) -> usize {
+async fn select<A: AudioSink>(wdt: &mut Watchdog, audio: &mut A) -> usize {
     RACE_VIEW.signal(RaceView { mode: Mode::Attract, progress: [0.0; LANES] });
 
     // Wait for the first selection.
@@ -97,14 +96,14 @@ async fn select(wdt: &mut Watchdog, audio: &mut NullAudio) -> usize {
         }
     };
     RACE_VIEW.signal(RaceView { mode: Mode::Select(pick as u8), progress: [0.0; LANES] });
-    audio.play(Sound::Bet);
+    audio.play(Sound::Bet(pick as u8)); // one clip per duck
 
     loop {
         match recv(wdt).await {
             Event::Select(d) => {
                 pick = (d as usize).min(LANES - 1);
                 RACE_VIEW.signal(RaceView { mode: Mode::Select(pick as u8), progress: [0.0; LANES] });
-                audio.play(Sound::Bet);
+                audio.play(Sound::Bet(pick as u8));
             }
             Event::Go => return pick,
             _ => {}
@@ -135,10 +134,10 @@ fn roll_speed(rng: &mut RoscRng, base_pct: u8) -> u8 {
 /// re-rolling a new speed (or occasionally a brief stall) at random intervals, so the
 /// lead changes hands. Fully random — nothing is pre-determined and the finish switch
 /// alone decides the winner. See IMPLEMENTATION.md §7.2.
-async fn race(
+async fn race<A: AudioSink>(
     motors: &mut Motors<'_>,
     wdt: &mut Watchdog,
-    audio: &mut NullAudio,
+    audio: &mut A,
     base: &Baselines,
 ) -> Option<usize> {
     let mut rng = RoscRng;
@@ -239,16 +238,19 @@ async fn race(
     winner
 }
 
-async fn show_winner(
+async fn show_winner<A: AudioSink>(
     motors: &mut Motors<'_>,
     wdt: &mut Watchdog,
-    audio: &mut NullAudio,
+    audio: &mut A,
+    pick: usize,
     winner: Option<usize>,
 ) {
     match winner {
         Some(w) => {
-            defmt::info!("winner: duck {}", w);
-            audio.play(Sound::Finish);
+            // Win/lose is relative to the duck the player picked, not to lane 0.
+            let won = w == pick;
+            defmt::info!("winner: duck {} (player picked {}) -> {}", w, pick, if won { "WIN" } else { "LOSE" });
+            audio.play(if won { Sound::Win } else { Sound::Lose });
             RACE_VIEW.signal(RaceView { mode: Mode::Winner(w as u8), progress: [1.0; LANES] });
         }
         None => defmt::warn!("race timed out with no finisher"),
