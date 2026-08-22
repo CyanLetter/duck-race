@@ -602,9 +602,32 @@ parked on their home switches at power-up (three-of-four had masked them):
 `home()` logs the raw switch state on every entry (`home: switch closed = [..]`), which
 separates "the cache is wrong" from "the switch isn't physically closing" in one glance.
 
-**Considered and rejected: nudging the gantry forward at boot** to force a fresh edge. It
-treats the symptom, moves the machine before its state is known, is visible to players,
-and leaves the same hang in every other place that waits on a limit switch.
+**Considered and rejected as a *detection* fix: nudging the gantry forward at boot** to
+force a fresh edge. It treats the symptom, moves the machine before its state is known,
+and leaves the same hang everywhere else that waits on a limit switch. (A boot nudge does
+now exist — but for a genuine mechanical reason, not to paper over detection. See §7.1.1.)
+
+#### 7.1.1 Boot nudge — a mechanical remedy, not a detection one
+
+With detection correct, one physical failure remained: a gantry can come to rest **just
+shy of its home switch's trip point** — close enough to look parked, not close enough to
+close the contact — and reversing into an already seated gantry does not reliably move it
+that last fraction of a millimetre.
+
+So `run()` performs a **one-shot forward nudge before the first `home()`**
+(`BOOT_NUDGE_PCT` for `BOOT_NUDGE_MS`, default 85 % for 200 ms ≈ 2 in). Every lane backs
+off the home region, and the homing pass that follows arrives with momentum and seats the
+switch cleanly. `BOOT_NUDGE_MS = 0` disables it.
+
+Two details that matter:
+
+- **Lanes already on their finish switch are skipped**, so a gantry parked at the far end
+  can't be driven into the finish bumper. Forward is per-lane (each motor owns its IN1),
+  so skipping one lane is free — unlike reverse, which is shared (§4.2).
+- **It waits ~3 × `DEBOUNCE_MS` afterwards** before returning. The nudge *opens* the home
+  switches, and the level cache only clears once each input task has seen the change and
+  debounced it. Skip the settle and `home()` samples the pre-nudge state and concludes
+  every lane is already home — the exact stale-level failure §7.1 exists to prevent.
 - **`game.rs`** — owns `Motors`, the FSM, and per-race randomization (`SmallRng` seeded
   from `RoscRng`). Publishes the current `Mode` via
   `Signal<CriticalSectionRawMutex, Mode>` for the renderer.
@@ -616,7 +639,8 @@ and leaves the same hang in every other place that waits on a limit switch.
 
 | State | Behavior | → next |
 |-------|----------|--------|
-| **Home** | `reverse_all(homing)`; wait until all 4 StartHit (per-lane `with_timeout`), then cut power | Attract |
+| *(boot only)* | one-shot forward nudge off the home switches (§7.1.1) | Home |
+| **Home** | seed from switch *levels*; if any lane is short, `reverse_all(homing)` until every home switch is closed, then cut power | Attract |
 | **Attract** | slow marquee chase (§5.5); wait for any `Select` | Selecting |
 | **Selecting** | track current pick; `Select` updates it; light its lane | on `Go` (pick set) → Race |
 | **Race** | signal lights + music, hold the field `RACE_START_DELAY_MS`, then kick and run per-lane speed segments that re-roll mid-race (§7.3); await first `EndHit` (overall `with_timeout`) | on `EndHit(w)` → Winner(w); on timeout → Home |

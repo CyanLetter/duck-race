@@ -9,9 +9,10 @@ use embassy_time::{with_timeout, Duration, Instant, Timer};
 use crate::audio::{AudioSink, Sound};
 use crate::calibrate::{self, Baselines, CalFlash};
 use crate::config::{
-    FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, RACE_START_DELAY_MS, RACE_TIMEOUT_MS,
-    RESET_TIMEOUT_MS, RESUME_KICK_MS, SEGMENT_MAX_MS, SEGMENT_MIN_MS, SPEED_SPREAD_PCT,
-    STALL_CHANCE_PCT, STALL_MAX_MS, STALL_MIN_MS, WINNER_SHOW_MS,
+    BOOT_NUDGE_MS, BOOT_NUDGE_PCT, DEBOUNCE_MS, FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT,
+    LANES, RACE_START_DELAY_MS, RACE_TIMEOUT_MS, RESET_TIMEOUT_MS, RESUME_KICK_MS,
+    SEGMENT_MAX_MS, SEGMENT_MIN_MS, SPEED_SPREAD_PCT, STALL_CHANCE_PCT, STALL_MAX_MS,
+    STALL_MIN_MS, WINNER_SHOW_MS,
 };
 use crate::inputs::{self, recv, Event, EVENTS};
 use crate::leds::{Mode, RACE_VIEW};
@@ -26,6 +27,9 @@ pub async fn run<A: AudioSink>(
     boot_tune: bool,
     mut audio: A,
 ) {
+    // Once, at power-up, before anything else moves.
+    boot_nudge(&mut motors, &mut wdt).await;
+
     if boot_tune {
         calibrate::tune_mode(&mut motors, &mut wdt, &mut flash, &mut base).await;
     }
@@ -36,6 +40,56 @@ pub async fn run<A: AudioSink>(
         let winner = race(&mut motors, &mut wdt, &mut audio, &base).await;
         show_winner(&mut motors, &mut wdt, &mut audio, pick, winner).await;
     }
+}
+
+/// Boot-only forward nudge — see `BOOT_NUDGE_MS`.
+///
+/// Backs every lane off the home region so the homing pass that follows arrives with
+/// momentum, which seats a switch that a gantry resting a hair short of the trip point
+/// would otherwise never close.
+///
+/// **Skips any lane already sitting on its finish switch**, so a gantry parked at the far
+/// end can't be driven into the finish bumper by the nudge. Forward is per-lane (each
+/// motor has its own IN1), so skipping one lane is free — unlike reverse, which is shared.
+async fn boot_nudge(motors: &mut Motors<'_>, wdt: &mut Watchdog) {
+    if BOOT_NUDGE_MS == 0 {
+        return;
+    }
+    let mut duties = [0u8; LANES];
+    let mut moving = 0usize;
+    for l in 0..LANES {
+        if inputs::end_closed(l) {
+            defmt::info!("boot nudge: lane {} already at the finish — skipping", l);
+        } else {
+            duties[l] = BOOT_NUDGE_PCT;
+            moving += 1;
+        }
+    }
+    if moving == 0 {
+        return;
+    }
+
+    defmt::info!(
+        "boot nudge: {} lane(s) forward at {}% for {} ms",
+        moving,
+        BOOT_NUDGE_PCT,
+        BOOT_NUDGE_MS
+    );
+    RACE_VIEW.signal(Mode::Home);
+    motors.enable(true);
+    motors.race_forward(duties);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(BOOT_NUDGE_MS) {
+        wdt.feed();
+        Timer::after(Duration::from_millis(20)).await;
+    }
+    motors.coast_all();
+
+    // Let the now-open home switches debounce through their input tasks before `home()`
+    // samples the level cache — otherwise it reads the pre-nudge `closed` state and
+    // concludes every lane is already home.
+    Timer::after(Duration::from_millis(DEBOUNCE_MS * 3)).await;
+    wdt.feed();
 }
 
 /// Reverse all lanes into their home bumpers until every start switch is closed (shared

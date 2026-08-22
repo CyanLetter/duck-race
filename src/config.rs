@@ -55,6 +55,17 @@ pub const STALL_MAX_MS: u64 = 300;
 /// gets `KICK_PCT` for this long before settling to its new speed.
 pub const RESUME_KICK_MS: u64 = 90;
 
+// ---- Boot ------------------------------------------------------------------
+/// One-shot forward nudge at power-up, run once before the first homing pass.
+///
+/// A gantry can come to rest *just* shy of its home switch's trip point — close enough to
+/// look parked, not close enough to close the contact — and reversing into an already
+/// seated gantry won't reliably move it the last fraction of a millimetre. Backing every
+/// lane off the home region first means the home run arrives with momentum and seats the
+/// switch cleanly. Set `BOOT_NUDGE_MS = 0` to disable.
+pub const BOOT_NUDGE_PCT: u8 = 85;
+pub const BOOT_NUDGE_MS: u64 = 200;
+
 // ---- Timing ---------------------------------------------------------------
 /// Beat between GO and the ducks actually launching. Music and lights start immediately;
 /// the field is held for this long. The audio module takes a moment to spin up, and the
