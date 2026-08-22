@@ -14,7 +14,7 @@ use crate::config::{
     BASE_DEFAULT_PCT, FLOOR_PCT, HOMING_PCT, LANES, RACE_TIMEOUT_MS, RESET_TIMEOUT_MS,
 };
 use crate::inputs::{self, recv, Event, EVENTS};
-use crate::leds::{Mode, RaceView, RACE_VIEW};
+use crate::leds::{Mode, RACE_VIEW};
 use crate::motors::Motors;
 
 pub const FLASH_SIZE: usize = 2 * 1024 * 1024;
@@ -86,13 +86,13 @@ pub async fn tune_mode(
 ) {
     defmt::info!("TUNE mode — select lane, UP/DOWN adjust, GO test, hold-GO save+exit");
     let mut active = 0usize;
-    RACE_VIEW.signal(RaceView { mode: Mode::Select(active as u8), progress: [0.0; LANES] });
+    RACE_VIEW.signal(Mode::Select(active as u8));
 
     loop {
         match recv(wdt).await {
             Event::Select(d) => {
                 active = (d as usize).min(LANES - 1);
-                RACE_VIEW.signal(RaceView { mode: Mode::Select(active as u8), progress: [0.0; LANES] });
+                RACE_VIEW.signal(Mode::Select(active as u8));
             }
             Event::Up => {
                 base.pct[active] = (base.pct[active] + 2).min(100);

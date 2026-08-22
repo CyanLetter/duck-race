@@ -15,12 +15,19 @@ use embassy_rp::pio::{Common, StateMachine};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use libm::{powf, sinf};
+use libm::{expf, powf, sinf};
 use smart_leds::RGB8;
 
-use crate::config::{COUNTS, FRAME_MS, LANES, NUM_LEDS, ROWS};
+use crate::config::{
+    CHASE_SPACING, CHASE_STEP_MS_ATTRACT, CHASE_STEP_MS_RACE, CHASE_TAU_STEPS, COUNTS,
+    FRAME_MS, LANES, NUM_LEDS, ROWS,
+};
 
 /// What the renderer should draw. Produced by the game task, consumed by `led_task`.
+///
+/// Note there is no per-lane progress here: during a race every row runs the same marquee
+/// chase rather than tracking where its duck actually is. The ducks are visible in profile
+/// in a side-on cabinet, so the lights are set dressing, not a readout.
 #[derive(Clone, Copy)]
 pub enum Mode {
     Home,
@@ -30,20 +37,8 @@ pub enum Mode {
     Winner(u8),
 }
 
-#[derive(Clone, Copy)]
-pub struct RaceView {
-    pub mode: Mode,
-    pub progress: [f32; LANES],
-}
-
-impl Default for RaceView {
-    fn default() -> Self {
-        Self { mode: Mode::Home, progress: [0.0; LANES] }
-    }
-}
-
 /// Latest render state. `led_task` polls this each frame (never blocks on it).
-pub static RACE_VIEW: Signal<CriticalSectionRawMutex, RaceView> = Signal::new();
+pub static RACE_VIEW: Signal<CriticalSectionRawMutex, Mode> = Signal::new();
 
 /// Distinct colour per duck (indexed by lane).
 pub const DUCK_COLORS: [RGB8; LANES] = [
@@ -52,6 +47,16 @@ pub const DUCK_COLORS: [RGB8; LANES] = [
     RGB8 { r: 0, g: 220, b: 40 },  // green
     RGB8 { r: 235, g: 190, b: 0 }, // yellow
 ];
+
+/// Warm-white filament colour for the marquee chase. Pre-gamma — after the 2.2 LUT this
+/// lands near a ~2700 K incandescent rather than a cold white. To chase in each lane's own
+/// colour instead, pass `DUCK_COLORS[row]` inside `draw_chase`.
+// pub const CHASE_COLOR: RGB8 = RGB8 { r: 255, g: 180, b: 100 };
+pub const CHASE_COLOR: RGB8 = RGB8 { r: 150, g: 90, b: 50 };
+
+/// Resolution of the bulb-decay curve. Indexed by "age since this pixel was the bulb",
+/// scaled over one full `CHASE_SPACING` interval.
+const CHASE_LUT_LEN: usize = 128;
 
 /// Prefix sums of COUNTS → each row's start index in the chain.
 const fn offsets() -> [usize; ROWS] {
@@ -74,16 +79,11 @@ fn phys_index(r: usize, p: usize) -> usize {
     }
 }
 
-/// Map a progress fraction (0=start, 1=finish) to a position within row `r`.
-fn pos(r: usize, f: f32) -> usize {
-    let f = f.clamp(0.0, 1.0);
-    (f * (COUNTS[r] - 1) as f32 + 0.5) as usize
-}
-
 pub struct LedController<'d> {
     ws: PioWs2812<'d, PIO0, 0, NUM_LEDS, Grb>,
     fb: [RGB8; NUM_LEDS],
     gamma: [u8; 256],
+    chase: [u8; CHASE_LUT_LEN],
     t: f32,
 }
 
@@ -101,10 +101,18 @@ impl<'d> LedController<'d> {
         for (i, g) in gamma.iter_mut().enumerate() {
             *g = (powf(i as f32 / 255.0, 2.2) * 255.0) as u8;
         }
+        // Bulb decay curve, also precomputed: `expf` per pixel per frame would be the
+        // same soft-float mistake the reference project made with `powf` (§2.1).
+        let mut chase = [0u8; CHASE_LUT_LEN];
+        for (i, c) in chase.iter_mut().enumerate() {
+            let age = i as f32 / CHASE_LUT_LEN as f32 * CHASE_SPACING as f32;
+            *c = (expf(-age / CHASE_TAU_STEPS) * 255.0) as u8;
+        }
         Self {
             ws: PioWs2812::new(common, sm, dma, pin, program),
             fb: [RGB8::default(); NUM_LEDS],
             gamma,
+            chase,
             t: 0.0,
         }
     }
@@ -125,17 +133,32 @@ impl<'d> LedController<'d> {
         p.b = p.b.max(c.b);
     }
 
-    /// Draw a comet at progress `f` in `lane`'s row, with a short fading tail.
-    /// (`max_px` here only merges the comet's own overlapping tail — the shared-column
-    /// compositing the top-down layout needed is gone now that lane↔row is 1:1.)
-    fn draw_comet(&mut self, lane: usize, f: f32, color: RGB8) {
-        const TAIL: usize = 3;
-        let head = pos(lane, f);
-        for k in 0..=TAIL {
-            if head >= k {
-                let bright = 1.0 - (k as f32 / (TAIL as f32 + 1.0));
-                let idx = phys_index(lane, head - k);
+    /// Carnival-marquee chase, drawn identically on every row and in sync across rows so
+    /// the whole board reads as one sign.
+    ///
+    /// A bulb lights at every `CHASE_SPACING`-th pixel and the whole set advances one
+    /// pixel every `step_ms`, travelling start → finish. Each bulb snaps to full and then
+    /// decays exponentially, which is what makes it look like a hot filament cooling
+    /// rather than an LED switching off.
+    ///
+    /// Stateless: brightness is a pure function of "how long since this pixel was last a
+    /// bulb", so there's no per-pixel decay buffer to keep in step with the frame rate.
+    fn draw_chase(&mut self, step_ms: u64, color: RGB8) {
+        let span = CHASE_SPACING as f32;
+        // Chase position in pixel-steps. Fractional, so the fade is smooth between steps
+        // instead of the whole pattern jumping once per step.
+        let phase = self.t * 1000.0 / step_ms as f32;
+        for row in 0..ROWS {
+            for p in 0..COUNTS[row] {
+                // Steps elapsed since this pixel was the bulb, wrapped into [0, spacing).
+                let mut age = (phase - p as f32) % span;
+                if age < 0.0 {
+                    age += span;
+                }
+                let lut = ((age / span) * CHASE_LUT_LEN as f32) as usize;
+                let bright = self.chase[lut.min(CHASE_LUT_LEN - 1)] as f32 / 255.0;
                 let c = self.scaled(color, bright);
+                let idx = phys_index(row, p);
                 Self::max_px(&mut self.fb, idx, c);
             }
         }
@@ -149,15 +172,21 @@ impl<'d> LedController<'d> {
         }
     }
 
-    /// Render the current view and push it to the strip. Called every ~FRAME_MS.
-    pub async fn render(&mut self, view: &RaceView) {
+    /// Render the current mode and push it to the strip. Called every ~FRAME_MS.
+    pub async fn render(&mut self, mode: Mode) {
         self.t += FRAME_MS as f32 / 1000.0;
+        // Wrap on a whole number of ATTRACT chase periods (period = SPACING × step). The
+        // chase phase is `t / step % SPACING`, so subtracting an exact multiple of the
+        // period leaves the pattern untouched — no jump when the clock rolls over. Attract
+        // is the mode that actually runs for hours; a race is ~12 s, so the odds of it
+        // straddling the wrap are negligible and the artefact would be under one step.
+        let chase_period = CHASE_SPACING as f32 * CHASE_STEP_MS_ATTRACT as f32 / 1000.0;
         if self.t > 3600.0 {
-            self.t -= 3600.0;
+            self.t -= chase_period * (3600.0 / chase_period) as i32 as f32;
         }
         self.fb = [RGB8::default(); NUM_LEDS];
 
-        match view.mode {
+        match mode {
             Mode::Home => {
                 // Dim amber breathing while returning to home.
                 let b = 0.15 + 0.1 * (0.5 + 0.5 * sinf(self.t * 3.0));
@@ -166,11 +195,8 @@ impl<'d> LedController<'d> {
                 }
             }
             Mode::Attract => {
-                // Slow travelling shimmer across all lanes in each duck's colour.
-                for l in 0..LANES {
-                    let b = 0.10 + 0.35 * (0.5 + 0.5 * sinf(self.t * 2.0 + l as f32 * 1.3));
-                    self.fill_lane(l, DUCK_COLORS[l], b);
-                }
+                // The same marquee as the race, just idling along slower.
+                self.draw_chase(CHASE_STEP_MS_ATTRACT, CHASE_COLOR);
             }
             Mode::Select(sel) => {
                 let sel = sel as usize;
@@ -184,9 +210,9 @@ impl<'d> LedController<'d> {
                 }
             }
             Mode::Race => {
-                for l in 0..LANES {
-                    self.draw_comet(l, view.progress[l], DUCK_COLORS[l]);
-                }
+                // Marquee at full speed. Deliberately NOT a position readout — this runs
+                // from the moment GO is pressed, through the start delay, to the finish.
+                self.draw_chase(CHASE_STEP_MS_RACE, CHASE_COLOR);
             }
             Mode::Winner(w) => {
                 let w = w as usize;
@@ -257,13 +283,13 @@ impl<'d> LedController<'d> {
 #[embassy_executor::task]
 pub async fn led_task(mut leds: LedController<'static>) {
     use embassy_time::{Duration, Ticker};
-    let mut view = RaceView::default();
+    let mut mode = Mode::Home;
     let mut ticker = Ticker::every(Duration::from_millis(FRAME_MS));
     loop {
-        if let Some(v) = RACE_VIEW.try_take() {
-            view = v;
+        if let Some(m) = RACE_VIEW.try_take() {
+            mode = m;
         }
-        leds.render(&view).await;
+        leds.render(mode).await;
         ticker.next().await;
     }
 }

@@ -87,8 +87,8 @@ per LED, every frame** — costly soft-float on the FPU-less M0+ (fine for 16 LE
 for our 72–144).
 
 **How this plan avoids all of it:**
-- **Dedicated `led_task` on a `Ticker`**, fed only a small `RaceView` snapshot — decoupled
-  from game logic (§7).
+- **Dedicated `led_task` on a `Ticker`**, fed only the current `Mode` — decoupled from game
+  logic (§7).
 - **The important part:** a separate task is *not by itself* a fix on a cooperative
   single-core executor. We're safe because **the duck-race has no long CPU-bound section
   during play** — motor PWM, RNG, and switch handling are all trivial and yield. So nothing
@@ -297,7 +297,7 @@ single biggest firmware consequence of the motor swap, and every duty constant m
 | `HOMING_PCT` | 35 | **40** | 35 % is only ~97 mm/s now → 6.3 s to home a full lane. 40 % ≈ 111 mm/s. Still gentle: N20 stall torque is low, so the press into the bumper is *softer* than the TT's despite the higher duty |
 | `RESET_TIMEOUT_MS` | 8 000 | **10 000** | worst case is homing from the finish line at `HOMING_PCT` |
 | `SPEED_SPREAD_PCT` | 12 (duty points) | **20 (percent of baseline)** | **semantics changed** — see below. The old ±12 on a base of 60 was ±20 % relative; kept as ±20 %, which is ≈ ±7 points at the new base of 36. Leaving it at 12 *points* would have meant ±33 % relative → 8.9 s vs 4.5 s finishes, a blowout every race |
-| `NOMINAL_SECS` | 5.0 | **6.0** | keeps the LED dead-reckoning matched to the new base duty |
+| `NOMINAL_SECS` | 5.0 | *(removed)* | only ever scaled the LED position dead-reckoning, which the marquee chase replaced (§5.4) |
 | `JOG_DUTY_PCT` | 100 | **35** ⚠️ | **safety**: `test-motors` has no software end stop, and 100 % is now ~11 in/s. A full lane traverses in 2.2 s |
 
 > **Done — `SPEED_SPREAD_PCT` is now relative.** In absolute duty points it had to be
@@ -437,29 +437,65 @@ matters more:
 | 60 LEDs/m | 36 | **144** | 17 mm/pixel | ~3.0 A |
 
 Either fits the 5 V/10 A budget and the RP2040 (144 × 3 B = 432 B of framebuffer). **The
-plan defaults to `[18; 4]` (72 total, down from 90)** — bump to `[36; 4]` if the comet
-looks steppy once assembled, and cap attract-mode brightness either way.
+plan defaulted to `[18; 4]`; the build shipped with **60 LEDs/m, `[39; 4]` = 156 total**,
+which also gives the marquee chase (§5.5) enough pixels for a convincing bulb spacing.
 
 ### 5.4 Rendering
 
-Work entirely in **(lane, progress)** space; `phys_index` handles wiring direction.
+Work entirely in **(lane, position)** space; `phys_index` handles wiring direction.
 
-- **Race chase** — for each lane `i` at progress `f_i`, draw a comet with a short fading
-  tail at `phys_index(i, pos(i, f_i))`. **One row, one comet** — the per-pixel `max`
-  compositing that existed to merge two comets on a shared interior column is no longer
-  needed for that purpose (keep `max` only for a comet's own overlapping tail).
-- **Selecting** — light the selected lane's row (solid/dim pulse) in that duck's colour,
-  others dim.
-- **Winner** — bright flash + chase along the winning lane's row.
-- **Attract** — slow idle shimmer across all rows. Borrow the reference's pulse *idea* but
-  **not its per-frame `powf`/`sinf` per channel** — use a **256-entry gamma LUT** and keep
-  transcendentals out of the inner loop (§2.1).
+- **Race** — the **carnival marquee chase** (§5.5). Deliberately **not** a position
+  readout: it does not track where any duck actually is.
+- **Attract** — the same chase, slower (`CHASE_STEP_MS_ATTRACT` vs `..._RACE`).
+- **Selecting** — light the selected lane's row (pulsing) in that duck's colour, others
+  dim. This is where lane identity matters, so it stays duck-coloured.
+- **Winner** — bright blinking fill on the winning lane's row.
+- **Home** — dim amber breathing across all rows.
 - Frame tick ~30 ms in `led_task`; game logic never blocks it (§7, §2.1).
 
-> **Side-on opens up an effect that top-down couldn't do:** because each lane owns a full
-> row, the row can double as a **per-lane progress bar** (fill behind the duck) rather than
-> just a comet — reads clearly in profile from across a convention hall. Same data, one
-> branch in `render`. Worth trying once the strips are up.
+> **Dropped: per-lane position tracking.** The race used to dead-reckon each duck's
+> progress from elapsed time × commanded duty and draw a comet at that point. It's gone,
+> along with `RaceView.progress`, `draw_comet` and `pos`. Two reasons: in a side-on cabinet
+> the duck itself is plainly visible, so a synthetic position readout added nothing; and
+> once speeds began varying mid-race (§7.3) the dead-reckoning had to be integrated per
+> frame to stay honest, which was real work to keep a display nobody was reading. The
+> render signal is now just `Mode`.
+
+### 5.5 The marquee chase — old incandescent carnival lights
+
+Every row runs the **same chase, in phase**, so the whole board reads as one sign.
+
+- A bulb lights at **every `CHASE_SPACING`-th pixel** (default 5) and the whole set
+  advances **one pixel per `step_ms`**, travelling start → finish.
+- Each bulb **snaps to full and then decays exponentially**. That asymmetry — instant on,
+  slow off — is the entire trick: it's what a hot filament does when the current stops, and
+  it's what separates "carnival" from "LED strip".
+- Decay is `exp(-age / CHASE_TAU_STEPS)` where `age` is measured in **pixel-steps since
+  this pixel was last the bulb**. At τ = 1.6 a bulb is at ~54 % one step later and ~8 %
+  four steps later, so a tail has just faded out as the next bulb arrives — bulbs never
+  fully extinguish, which is also true of the real thing at speed.
+
+**Two implementation notes that matter:**
+
+1. **It's stateless.** Brightness is a pure function of `(phase − position) mod spacing`,
+   so there's no per-pixel decay buffer that has to be stepped in lockstep with the frame
+   rate. Frame jitter can't corrupt the pattern, and the animation is fully determined by
+   the clock.
+2. **The decay curve is a LUT** (`CHASE_LUT_LEN` = 128 entries, built once at
+   construction). Calling `expf` per pixel per frame would be the same soft-float mistake
+   the reference project made with `powf` (§2.1) — 156 pixels × 33 fps of transcendentals
+   on an FPU-less M0+.
+
+`phase` is fractional, not integer, so the fade is smooth *between* steps rather than the
+whole pattern jumping once per step.
+
+**Colour:** `CHASE_COLOR`, a warm white (pre-gamma `255,180,100`) that lands near 2700 K
+once the gamma LUT is applied. To chase in each lane's own duck colour instead, pass
+`DUCK_COLORS[row]` inside `draw_chase` — one line.
+
+**Tuning:** `CHASE_SPACING` = bulb density; `CHASE_STEP_MS_*` = speed (lower is faster);
+`CHASE_TAU_STEPS` = tail length. Note spacing need not divide the row length — 39 pixels
+with spacing 5 is fine and looks the way a real marquee does.
 
 Progress `f_i(t)` is **dead-reckoned from elapsed time × commanded speed** (no mid-track
 sensor), clamped to 1 at the finish switch. The LED chase reflects *commanded* progress;
@@ -490,7 +526,7 @@ larger fraction of the commanded speed than it was with the TTs. Two ways;
   KV). Load on boot; fall back to safe defaults if magic/CRC invalid. **Write only on
   explicit save** (flash wear).
 - The baseline is the *centre* each lane's mid-race speed segments are rolled around
-  (§7.2) — calibration makes the lanes fair, the segment rolls add the fun.
+  (§7.3) — calibration makes the lanes fair, the segment rolls add the fun.
 
 ### 6.2 Alternative — physical trim knobs (if you'd rather have knobs)
 
@@ -547,8 +583,8 @@ leftover `EndHit` sitting in the queue would otherwise score an instant false wi
 treats the symptom, moves the machine before its state is known, is visible to players,
 and leaves the same hang in every other place that waits on a limit switch.
 - **`game.rs`** — owns `Motors`, the FSM, and per-race randomization (`SmallRng` seeded
-  from `RoscRng`). Publishes a `RaceView { progress:[f32;4], mode }` via
-  `Signal<CriticalSectionRawMutex, RaceView>` for the renderer.
+  from `RoscRng`). Publishes the current `Mode` via
+  `Signal<CriticalSectionRawMutex, Mode>` for the renderer.
 - **`led_task`** — owns `PioWs2812`; on a ~30 ms ticker reads `RACE_VIEW` and draws (§5.4).
 - **`calibrate.rs`, `audio.rs`** — see §6, §9.
 - Single-core executor is plenty. Feed the `Watchdog` (~8 s) at the top of the game loop.
@@ -558,16 +594,35 @@ and leaves the same hang in every other place that waits on a limit switch.
 | State | Behavior | → next |
 |-------|----------|--------|
 | **Home** | `reverse_all(homing)`; wait until all 4 StartHit (per-lane `with_timeout`), then cut power | Attract |
-| **Attract** | idle shimmer; wait for any `Select` | Selecting |
+| **Attract** | slow marquee chase (§5.5); wait for any `Select` | Selecting |
 | **Selecting** | track current pick; `Select` updates it; light its lane | on `Go` (pick set) → Race |
-| **Race** | kick, then run per-lane speed segments that re-roll mid-race (§7.2), publishing progress; await first `EndHit` (overall `with_timeout`) | on `EndHit(w)` → Winner(w); on timeout → Home |
+| **Race** | signal lights + music, hold the field `RACE_START_DELAY_MS`, then kick and run per-lane speed segments that re-roll mid-race (§7.3); await first `EndHit` (overall `with_timeout`) | on `EndHit(w)` → Winner(w); on timeout → Home |
 | **Winner(w)** | `brake_all`; winner flash/chase; (future: sound); ~4 s | Home |
 | **Tune** | calibration UX (§6); entered only via GO-held-at-boot | Home (on save) |
 
 Input gating: ignore `Select/Go` during Race/Home; ignore `StartHit/EndHit` when not
 racing/homing.
 
-### 7.2 Race speed model — segments, not a single roll
+### 7.2 Race start — lights and music lead the ducks
+
+Pressing GO does **not** launch the field immediately. In order:
+
+1. `Mode::Race` is signalled and `Sound::Race` fires — the marquee (§5.5) starts at full
+   speed and the music begins.
+2. The field is **held for `RACE_START_DELAY_MS`** (default 1 s), watchdog fed, motors
+   enabled but at zero.
+3. The event queue is drained (*after* the hold, so anything that arrived during it goes
+   too), then the launch kick fires and the speed segments below begin.
+
+Two reasons for the hold: the DY-SV8F takes a moment to spin up after a play command, so
+launching on the same instant means the ducks beat the music out of the gate; and the beat
+of anticipation is simply better showmanship. The renderer is a separate task, so the
+marquee animates normally throughout the hold.
+
+The race clock (`RACE_TIMEOUT_MS`) starts **after** the hold, so the delay doesn't eat into
+the timeout budget.
+
+### 7.3 Race speed model — segments, not a single roll
 
 Speed varies **during** the race, not once at the start. Each lane runs an independent
 sequence of *segments*; when a lane's segment expires it re-rolls, and the lanes are
@@ -589,9 +644,10 @@ Four details that matter more than they look:
    again, and at these floors it may not restart without it.
 3. **No stall in the opening segment.** A duck sitting still off the line reads as a
    broken machine rather than as drama, so the first segment is always a running speed.
-4. **Progress is now integrated, not extrapolated.** The LED dead-reckoning was
-   `elapsed × duty`, which is only valid while duty is constant. It accumulates
-   `duty × dt` per frame instead, so a stalled duck's comet stops with it.
+4. **Nothing renders duck position.** Varying speed mid-race broke the old `elapsed ×
+   duty` LED dead-reckoning, which is only valid while duty is constant. Rather than
+   integrate `duty × dt` per frame to keep a synthetic readout honest, the race lights
+   became a marquee chase and the position tracking was removed outright (§5.4).
 
 **Race-time cost of stalls** ≈ `STALL_CHANCE_PCT × (mean stall ÷ mean segment)`. At the
 defaults that's ~7 % of the race spent stopped, so `RACE_TIMEOUT_MS` must stay comfortably
@@ -623,7 +679,7 @@ pub const KICK_PCT:          u8 = 90;  →  55
 pub const KICK_MS:          u64 = 120; →  60
 pub const HOMING_PCT:        u8 = 35;  →  40
 pub const SPEED_SPREAD_PCT:  u8 = 12;  →  20      // ⚠ semantics: now % OF BASELINE, not duty points
-pub const NOMINAL_SECS:     f32 = 5.0; →  6.0
+pub const NOMINAL_SECS:     f32 = 5.0; →  (removed — no position readout to scale, §5.4)
 pub const RESET_TIMEOUT_MS: u64 = 8_000; → 10_000
 pub const JOG_DUTY_PCT:      u8 = 100; →  35      // ⚠ safety: no software end stop in test-motors
 ```

@@ -56,9 +56,10 @@ pub const STALL_MAX_MS: u64 = 300;
 pub const RESUME_KICK_MS: u64 = 90;
 
 // ---- Timing ---------------------------------------------------------------
-/// Nominal race duration at the default baseline — used only to scale the LED
-/// progress animation (the real winner is decided by the finish switch).
-pub const NOMINAL_SECS: f32 = 6.0;
+/// Beat between GO and the ducks actually launching. Music and lights start immediately;
+/// the field is held for this long. The audio module takes a moment to spin up, and the
+/// anticipation reads better than ducks leaving before the music does.
+pub const RACE_START_DELAY_MS: u64 = 1_000;
 pub const RACE_TIMEOUT_MS: u64 = 12_000;
 /// Worst case is homing from the finish line at HOMING_PCT (~5.5 s), plus margin.
 pub const RESET_TIMEOUT_MS: u64 = 10_000;
@@ -88,3 +89,19 @@ pub const JOG_DUTY_PCT: u8 = 80;
 pub const ROWS: usize = LANES;
 pub const COUNTS: [usize; ROWS] = [39, 39, 39, 39];
 pub const NUM_LEDS: usize = COUNTS[0] + COUNTS[1] + COUNTS[2] + COUNTS[3];
+
+// ---- Marquee chase (old carnival incandescent look) -----------------------
+// Used for both RACE and ATTRACT — every row runs the same chase, in sync, so the whole
+// board reads as one marquee. Bulbs snap on and fade slowly, which is the thing that
+// separates "filament" from "LED". Race lights deliberately do NOT track duck position.
+
+/// One bright bulb every N pixels along each row.
+pub const CHASE_SPACING: usize = 5;
+/// Time for the chase to advance by one pixel during a race. Lower = faster.
+pub const CHASE_STEP_MS_RACE: u64 = 55;
+/// Same chase, slower, while idle.
+pub const CHASE_STEP_MS_ATTRACT: u64 = 150;
+/// Exponential fade time constant, measured in pixel-steps. Larger = longer, lazier
+/// tails. At 1.6 a bulb is down to ~54 % one step later and ~8 % four steps later, so the
+/// tail has just faded out as the next bulb arrives.
+pub const CHASE_TAU_STEPS: f32 = 1.6;

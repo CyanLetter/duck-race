@@ -9,12 +9,12 @@ use embassy_time::{with_timeout, Duration, Instant, Timer};
 use crate::audio::{AudioSink, Sound};
 use crate::calibrate::{self, Baselines, CalFlash};
 use crate::config::{
-    BASE_DEFAULT_PCT, FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, NOMINAL_SECS,
-    RACE_TIMEOUT_MS, RESET_TIMEOUT_MS, RESUME_KICK_MS, SEGMENT_MAX_MS, SEGMENT_MIN_MS,
-    SPEED_SPREAD_PCT, STALL_CHANCE_PCT, STALL_MAX_MS, STALL_MIN_MS, WINNER_SHOW_MS,
+    FLOOR_PCT, HOMING_PCT, KICK_MS, KICK_PCT, LANES, RACE_START_DELAY_MS, RACE_TIMEOUT_MS,
+    RESET_TIMEOUT_MS, RESUME_KICK_MS, SEGMENT_MAX_MS, SEGMENT_MIN_MS, SPEED_SPREAD_PCT,
+    STALL_CHANCE_PCT, STALL_MAX_MS, STALL_MIN_MS, WINNER_SHOW_MS,
 };
 use crate::inputs::{self, recv, Event, EVENTS};
-use crate::leds::{Mode, RaceView, RACE_VIEW};
+use crate::leds::{Mode, RACE_VIEW};
 use crate::motors::Motors;
 
 /// Never-returning game driver.
@@ -45,7 +45,7 @@ pub async fn run<A: AudioSink>(
 /// home switch (very common at power-up) never produces a falling edge, so an
 /// events-only wait would hang until `RESET_TIMEOUT_MS` every single boot.
 async fn home<A: AudioSink>(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: &mut A) {
-    RACE_VIEW.signal(RaceView { mode: Mode::Home, progress: [0.0; LANES] });
+    RACE_VIEW.signal(Mode::Home);
     audio.play(Sound::Home);
     motors.enable(true);
 
@@ -87,7 +87,7 @@ async fn home<A: AudioSink>(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: 
 
 /// Attract until a duck is selected, then let the player change the pick until GO.
 async fn select<A: AudioSink>(wdt: &mut Watchdog, audio: &mut A) -> usize {
-    RACE_VIEW.signal(RaceView { mode: Mode::Attract, progress: [0.0; LANES] });
+    RACE_VIEW.signal(Mode::Attract);
 
     // Wait for the first selection.
     let mut pick = loop {
@@ -95,14 +95,14 @@ async fn select<A: AudioSink>(wdt: &mut Watchdog, audio: &mut A) -> usize {
             break (d as usize).min(LANES - 1);
         }
     };
-    RACE_VIEW.signal(RaceView { mode: Mode::Select(pick as u8), progress: [0.0; LANES] });
+    RACE_VIEW.signal(Mode::Select(pick as u8));
     audio.play(Sound::Bet(pick as u8)); // one clip per duck
 
     loop {
         match recv(wdt).await {
             Event::Select(d) => {
                 pick = (d as usize).min(LANES - 1);
-                RACE_VIEW.signal(RaceView { mode: Mode::Select(pick as u8), progress: [0.0; LANES] });
+                RACE_VIEW.signal(Mode::Select(pick as u8));
                 audio.play(Sound::Bet(pick as u8));
             }
             Event::Go => return pick,
@@ -142,14 +142,26 @@ async fn race<A: AudioSink>(
 ) -> Option<usize> {
     let mut rng = RoscRng;
 
-    // Winner detection stays EDGE-driven (unlike homing): the finish switches are the
-    // one measurement where timing resolution matters, and an edge lands sooner and more
-    // precisely than a polled level. That makes a stale queued edge dangerous, so start
-    // from an empty channel — a leftover EndHit would otherwise win instantly.
-    inputs::drain();
-
+    // Lights and music start the instant GO is pressed; the field is held for
+    // RACE_START_DELAY_MS. The audio module needs a moment to spin up, and the beat of
+    // anticipation reads far better than ducks leaving before the music does. The LED
+    // renderer is a separate task, so the marquee is already running through this hold.
+    RACE_VIEW.signal(Mode::Race);
     audio.play(Sound::Race);
     motors.enable(true);
+    let hold = Instant::now();
+    while hold.elapsed() < Duration::from_millis(RACE_START_DELAY_MS) {
+        wdt.feed();
+        Timer::after(Duration::from_millis(50)).await;
+    }
+
+    // Winner detection stays EDGE-driven (unlike homing): the finish switches are the
+    // one measurement where timing resolution matters, and an edge lands sooner and more
+    // precisely than a polled level. That makes a stale queued edge dangerous, so clear
+    // the channel here — after the hold, so anything that arrived during it goes too.
+    // A leftover EndHit would otherwise win instantly.
+    inputs::drain();
+
     motors.race_forward([KICK_PCT; LANES]); // launch kick, all lanes together
     Timer::after(Duration::from_millis(KICK_MS)).await;
 
@@ -167,8 +179,6 @@ async fn race<A: AudioSink>(
     defmt::info!("race opening duties {}", target);
 
     let mut commanded = [0u8; LANES];
-    let mut progress = [0.0f32; LANES];
-    let mut last = start;
     let winner;
     loop {
         wdt.feed();
@@ -207,15 +217,8 @@ async fn race<A: AudioSink>(
             commanded = cmd;
         }
 
-        // --- visual progress: INTEGRATE the duty actually commanded, since it now
-        //     changes mid-race (real finish is still decided by the switch) ---
-        let dt = (now - last).as_micros() as f32 / 1_000_000.0;
-        last = now;
-        for l in 0..LANES {
-            let step = cmd[l] as f32 * dt / (NOMINAL_SECS * BASE_DEFAULT_PCT as f32);
-            progress[l] = (progress[l] + step).min(1.0);
-        }
-        RACE_VIEW.signal(RaceView { mode: Mode::Race, progress });
+        // No per-lane progress to publish: the race lights are a marquee chase, not a
+        // position readout, and `Mode::Race` was signalled before the start delay.
 
         match with_timeout(Duration::from_millis(crate::config::FRAME_MS), EVENTS.receive()).await
         {
@@ -251,7 +254,7 @@ async fn show_winner<A: AudioSink>(
             let won = w == pick;
             defmt::info!("winner: duck {} (player picked {}) -> {}", w, pick, if won { "WIN" } else { "LOSE" });
             audio.play(if won { Sound::Win } else { Sound::Lose });
-            RACE_VIEW.signal(RaceView { mode: Mode::Winner(w as u8), progress: [1.0; LANES] });
+            RACE_VIEW.signal(Mode::Winner(w as u8));
         }
         None => defmt::warn!("race timed out with no finisher"),
     }
