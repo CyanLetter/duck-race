@@ -57,7 +57,7 @@ use embassy_time::{Duration, Timer};
 
 use crate::audio::DySv8f;
 use crate::config::WATCHDOG_MS;
-use crate::inputs::{go_task, input_task, Event};
+use crate::inputs::{go_task, Event};
 use crate::leds::{led_task, LedController};
 use crate::motors::Motors;
 
@@ -115,19 +115,35 @@ async fn main(_spawner: Spawner) {
     // ================= BRING-UP: single lane, to-finish-and-home =================
     #[cfg(feature = "test-lane")]
     {
-        _spawner.must_spawn(input_task(Input::new(p.PIN_10, Pull::Up), Event::Select(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_11, Pull::Up), Event::Select(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_12, Pull::Up), Event::Select(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_13, Pull::Up), Event::Select(3)));
+        let selects = [
+            (Input::new(p.PIN_10, Pull::Up), Event::Select(0)),
+            (Input::new(p.PIN_11, Pull::Up), Event::Select(1)),
+            (Input::new(p.PIN_12, Pull::Up), Event::Select(2)),
+            (Input::new(p.PIN_13, Pull::Up), Event::Select(3)),
+        ];
+        let home_sw = [
+            Input::new(p.PIN_18, Pull::Up),
+            Input::new(p.PIN_19, Pull::Up),
+            Input::new(p.PIN_20, Pull::Up),
+            Input::new(p.PIN_21, Pull::Up),
+        ];
+        let end_sw = [
+            Input::new(p.PIN_6, Pull::Up),
+            Input::new(p.PIN_7, Pull::Up),
+            Input::new(p.PIN_8, Pull::Up),
+            Input::new(p.PIN_9, Pull::Up),
+        ];
+        Timer::after(Duration::from_millis(50)).await; // let the pull-ups settle
         _spawner.must_spawn(go_task(Input::new(p.PIN_14, Pull::Up)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_18, Pull::Up), Event::StartHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_19, Pull::Up), Event::StartHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_20, Pull::Up), Event::StartHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_21, Pull::Up), Event::StartHit(3)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_6, Pull::Up), Event::EndHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_7, Pull::Up), Event::EndHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_8, Pull::Up), Event::EndHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_9, Pull::Up), Event::EndHit(3)));
+        for (pin, ev) in selects {
+            inputs::spawn_input(_spawner, pin, ev);
+        }
+        for (l, pin) in home_sw.into_iter().enumerate() {
+            inputs::spawn_input(_spawner, pin, Event::StartHit(l as u8));
+        }
+        for (l, pin) in end_sw.into_iter().enumerate() {
+            inputs::spawn_input(_spawner, pin, Event::EndHit(l as u8));
+        }
         let motors = Motors::build(
             p.PWM_SLICE1, p.PIN_2, p.PIN_3, p.PWM_SLICE2, p.PIN_4, p.PIN_5, p.PWM_SLICE5,
             p.PIN_26, p.PIN_27,
@@ -186,26 +202,47 @@ async fn main(_spawner: Spawner) {
         let leds = LedController::new(&mut common, sm0, p.DMA_CH0, p.PIN_22, &program);
         _spawner.must_spawn(led_task(leds));
 
-        // Inputs. GO first: sample held-at-boot to enter TUNE, then hand to its task.
+        // Inputs. Construct every pin FIRST, then settle, then sample/seed/spawn — the
+        // pull-ups need a moment to charge the line before a read is meaningful, and a
+        // premature read on an open switch would look like a closed one.
         let go = Input::new(p.PIN_14, Pull::Up);
+        let buttons = [
+            (Input::new(p.PIN_10, Pull::Up), Event::Select(0)),
+            (Input::new(p.PIN_11, Pull::Up), Event::Select(1)),
+            (Input::new(p.PIN_12, Pull::Up), Event::Select(2)),
+            (Input::new(p.PIN_13, Pull::Up), Event::Select(3)),
+            (Input::new(p.PIN_16, Pull::Up), Event::Up),
+            (Input::new(p.PIN_17, Pull::Up), Event::Down),
+        ];
+        let home_sw = [
+            Input::new(p.PIN_18, Pull::Up),
+            Input::new(p.PIN_19, Pull::Up),
+            Input::new(p.PIN_20, Pull::Up),
+            Input::new(p.PIN_21, Pull::Up),
+        ];
+        let end_sw = [
+            Input::new(p.PIN_6, Pull::Up),
+            Input::new(p.PIN_7, Pull::Up),
+            Input::new(p.PIN_8, Pull::Up),
+            Input::new(p.PIN_9, Pull::Up),
+        ];
         Timer::after(Duration::from_millis(50)).await;
+
+        // GO held at boot selects TUNE mode.
         let boot_tune = go.is_low();
         _spawner.must_spawn(go_task(go));
 
-        _spawner.must_spawn(input_task(Input::new(p.PIN_10, Pull::Up), Event::Select(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_11, Pull::Up), Event::Select(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_12, Pull::Up), Event::Select(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_13, Pull::Up), Event::Select(3)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_16, Pull::Up), Event::Up));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_17, Pull::Up), Event::Down));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_18, Pull::Up), Event::StartHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_19, Pull::Up), Event::StartHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_20, Pull::Up), Event::StartHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_21, Pull::Up), Event::StartHit(3)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_6, Pull::Up), Event::EndHit(0)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_7, Pull::Up), Event::EndHit(1)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_8, Pull::Up), Event::EndHit(2)));
-        _spawner.must_spawn(input_task(Input::new(p.PIN_9, Pull::Up), Event::EndHit(3)));
+        for (pin, ev) in buttons {
+            inputs::spawn_input(_spawner, pin, ev);
+        }
+        // Limit switches seed the level cache as they spawn, so the first `home()` sees
+        // the true resting state of every gantry even with no `.await` in between.
+        for (l, pin) in home_sw.into_iter().enumerate() {
+            inputs::spawn_input(_spawner, pin, Event::StartHit(l as u8));
+        }
+        for (l, pin) in end_sw.into_iter().enumerate() {
+            inputs::spawn_input(_spawner, pin, Event::EndHit(l as u8));
+        }
 
         // Flash-persisted baselines.
         let mut flash = calibrate::new_flash(p.FLASH);

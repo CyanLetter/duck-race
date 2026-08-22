@@ -57,12 +57,14 @@ async fn home<A: AudioSink>(motors: &mut Motors<'_>, wdt: &mut Watchdog, audio: 
             remaining += 1;
         }
     }
+    // Always log the raw switch state. If homing ever misbehaves, this line separates
+    // "the cache is wrong" from "the switch isn't actually closed" in one glance.
+    defmt::info!("home: switch closed = {}, {} lane(s) to move", homed, remaining);
     if remaining == 0 {
         defmt::info!("all lanes already home — no movement needed");
         motors.coast_all();
         return;
     }
-    defmt::info!("homing: {} lane(s) to go, already home = {}", remaining, homed);
     motors.reverse_all(HOMING_PCT);
 
     let start = Instant::now();

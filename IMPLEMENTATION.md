@@ -579,6 +579,29 @@ the full `RESET_TIMEOUT_MS`**. The rule that came out of it:
 The cost of the edge path is staleness, so `race()` calls `inputs::drain()` first — a
 leftover `EndHit` sitting in the queue would otherwise score an instant false win.
 
+**Two follow-on bugs in the level cache itself**, both found when *all four* lanes were
+parked on their home switches at power-up (three-of-four had masked them):
+
+1. **The level latched and never cleared.** `input_task` waited on a falling *edge*, then
+   debounced, then waited for release. A switch already closed at boot never produces that
+   falling edge, so the task parked on the first wait forever — and the `store(false)` on
+   release sat downstream of it, unreachable. Once seeded `true` the level stayed `true`
+   even after the gantry left home, so a later `home()` would take the "all lanes already
+   home" path and skip homing entirely. **Fix:** the task now waits on **levels**, always
+   for the *opposite* of where the pin currently is (`wait_for_high`/`wait_for_low` return
+   immediately when already satisfied), so it always gets to run again on a change and
+   writes the settled state every time.
+2. **The seed raced task scheduling.** The cache was written on the task's first poll, so
+   whether the first `home()` saw reality depended on something happening to `.await`
+   between spawning and homing — true only by accident, and silently broken by reordering
+   `main`. **Fix:** `inputs::spawn_input()` seeds the cache **synchronously at spawn time**,
+   before any await. `main` also now constructs every input pin, waits 50 ms for the
+   pull-ups to charge, and only then samples — a premature read on an open switch looks
+   exactly like a closed one.
+
+`home()` logs the raw switch state on every entry (`home: switch closed = [..]`), which
+separates "the cache is wrong" from "the switch isn't physically closing" in one glance.
+
 **Considered and rejected: nudging the gantry forward at boot** to force a fresh edge. It
 treats the symptom, moves the machine before its state is known, is visible to players,
 and leaves the same hang in every other place that waits on a limit switch.
